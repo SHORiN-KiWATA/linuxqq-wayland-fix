@@ -37,30 +37,28 @@ nix run github:xiaoyintx/linuxqq-wayland-fix
 nix profile install github:xiaoyintx/linuxqq-wayland-fix
 ```
 
-写进 NixOS / Home Manager 配置：
+在 flake 的 `inputs` 里加上：
 
 ```nix
-{
-  inputs.linuxqq-wayland-fix = {
+inputs = {
+  linuxqq-wayland-fix = {
     url = "github:xiaoyintx/linuxqq-wayland-fix";
-    # 与系统共用 nixpkgs，避免重复的 glib / QQ。（可选，但推荐）
+    # 与系统共用 nixpkgs，避免重复的 glib / QQ（可选，但推荐）
     inputs.nixpkgs.follows = "nixpkgs";
   };
-}
+};
 ```
 
+然后在 `home-manager.users` 下挂到对应用户：
+
 ```nix
-# 直接装包
-home.packages = [
-  inputs.linuxqq-wayland-fix.packages.${pkgs.stdenv.hostPlatform.system}.default
-];
-
-# 或引用模块
-# imports = [ inputs.linuxqq-wayland-fix.homeManagerModules.default ];
-# programs.linuxqq-wayland-fix.enable = true;
-
-# 或通过 overlay 使用 pkgs.linuxqq-wayland-fix
-# nixpkgs.overlays = [ inputs.linuxqq-wayland-fix.overlays.default ];
+home-manager.users.<用户名> =
+  { pkgs, inputs, ... }:
+  {
+    home.packages = [
+      inputs.linuxqq-wayland-fix.packages.${pkgs.stdenv.hostPlatform.system}.default
+    ];
+  };
 ```
 
 QQ 本体是 unfree，需要 `nixpkgs.config.allowUnfree = true;`。安装后从「QQ（Wayland修复版）」启动，用法与其它发行版一致。

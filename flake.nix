@@ -52,9 +52,12 @@
           '';
 
           # 启动器靠 QQ_WAYLAND_FIX_QQ 找到 nixpkgs 里的 QQ，并把自检所需的工具放进 PATH。
+          # QQ 的 broadcast-core 用 dlopen("libpipewire-0.3.so.0") 加载 PipeWire（不写死在 RUNPATH 里），
+          # NixOS 没有默认库搜索路径，必须把它加进 LD_LIBRARY_PATH，否则走不到 Wayland 采集、共享选源框不弹出。
           postFixup = ''
             wrapProgram $out/bin/linuxqq-wayland-fix \
               --set QQ_WAYLAND_FIX_QQ ${qq}/bin/qq \
+              --prefix LD_LIBRARY_PATH : ${pkgs.pipewire}/lib \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath (
                   with pkgs;
