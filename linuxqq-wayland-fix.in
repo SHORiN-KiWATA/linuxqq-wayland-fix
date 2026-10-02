@@ -7,7 +7,7 @@
 #   linuxqq-wayland-fix --version
 #
 # 环境变量：
-#   QQ_WAYLAND_FIX_QQ         QQ 的启动命令（默认先找 PATH 里的 linuxqq，再找 /opt/QQ/qq）
+#   QQ_WAYLAND_FIX_QQ         QQ 的启动命令（默认先找 PATH 里的 linuxqq/qq，再找 /opt/QQ/qq）
 #   QQ_WAYLAND_FIX_LOG        日志文件（默认 $XDG_RUNTIME_DIR/linuxqq-wayland-fix.log）
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
 #   QQ_CLIPBOARD_FIX_DISABLE=1 关闭剪贴板修复（排查问题用）
@@ -27,10 +27,11 @@ CRASH_KEEP="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-wayland-fix/crash"
 # QQ 崩溃时 Bugly 把调用栈写进 crash_files/tomb_*.txt，但 linuxqq 启动脚本每次都会清空这个目录。
 # 启动前把它们复制到缓存目录保存，--doctor 会列出最近的几次。
 keep_crash_records() {
-    local f
-    compgen -G "$QQ_CRASH_DIR/tomb_*.txt" >/dev/null || return 0
+    local f files=("$QQ_CRASH_DIR"/tomb_*.txt)
+    [[ -e "${files[0]}" ]] || return 0
     mkdir -p "$CRASH_KEEP" || return 0
-    for f in "$QQ_CRASH_DIR"/tomb_*.txt; do
+    for f in "${files[@]}"; do
+        [[ -e "$f" ]] || continue
         cp -p "$f" "$CRASH_KEEP/" 2>/dev/null
     done
     ls -1t "$CRASH_KEEP"/tomb_*.txt 2>/dev/null | tail -n +21 | xargs -r rm -f
@@ -42,9 +43,23 @@ find_qq() {
         echo "$QQ_WAYLAND_FIX_QQ"
     elif command -v linuxqq >/dev/null 2>&1; then
         command -v linuxqq
+    elif command -v qq >/dev/null 2>&1; then
+        command -v qq
     elif [[ -x /opt/QQ/qq ]]; then
         echo /opt/QQ/qq
     fi
+}
+
+# QQ 安装根目录（内含 qq 可执行文件与 resources/app）。
+# 传统发行版在 /opt/QQ；NixOS 等把 QQ 放在 store 里，从启动器路径反推。
+qq_root() {
+    local q d
+    q=$(find_qq)
+    if [[ -n "$q" ]]; then
+        d=$(dirname "$(readlink -f "$q" 2>/dev/null || echo "$q")")/../opt/QQ
+        [[ -d "$d" ]] && { readlink -f "$d"; return; }
+    fi
+    [[ -d /opt/QQ ]] && echo /opt/QQ
 }
 
 # 正在运行的 QQ 主进程（安装版在 /opt/QQ/qq，AppImage 版在挂载目录里，可执行文件都叫 qq）
@@ -60,14 +75,15 @@ qq_main_pid() {
 
 # 当前生效的 QQ 版本目录：热更新版本优先，否则用安装目录。
 qq_version_dir() {
-    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/QQ/versions" cur=""
+    local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/QQ/versions" cur="" root
     if [[ -f "$cfg/config.json" ]]; then
         cur=$(sed -n 's/.*"curVersion"[^"]*"\([^"]*\)".*/\1/p' "$cfg/config.json" | head -1)
     fi
     if [[ -n "$cur" && -d "$cfg/$cur" ]]; then
         echo "$cfg/$cur"
-    elif [[ -d /opt/QQ/resources/app ]]; then
-        echo /opt/QQ/resources/app
+    else
+        root=$(qq_root)
+        [[ -n "$root" && -d "$root/resources/app" ]] && echo "$root/resources/app"
     fi
 }
 
@@ -81,7 +97,7 @@ doctor() {
     echo
     echo "[基础]"
     local qq; qq=$(find_qq)
-    [[ -n "$qq" ]] && pass "QQ 启动方式: $qq" || bad "找不到 QQ（linuxqq 或 /opt/QQ/qq），可用 QQ_WAYLAND_FIX_QQ 指定"
+    [[ -n "$qq" ]] && pass "QQ 启动方式: $qq" || bad "找不到 QQ（linuxqq、qq 或 /opt/QQ/qq），可用 QQ_WAYLAND_FIX_QQ 指定"
     [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
     [[ -r "$CLIPBOARD_LIB" ]] && pass "剪贴板修复: $CLIPBOARD_LIB" || bad "找不到 $CLIPBOARD_LIB"
     [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
@@ -90,11 +106,15 @@ doctor() {
 
     echo
     echo "[QQ 内部实现（QQ 更新后用来判断修复是否还适用）]"
-    local vdir bc av wrapper
+    local vdir bc av wrapper qroot search=()
     vdir=$(qq_version_dir)
-    bc=$(find "$vdir" /opt/QQ -name broadcast-core.so -print -quit 2>/dev/null)
-    av=$(find "$vdir" /opt/QQ -name libAVSDKPlugin.so -print -quit 2>/dev/null)
-    wrapper=$(ls "$vdir/wrapper.node" /opt/QQ/resources/app/wrapper.node 2>/dev/null | head -1)
+    qroot=$(qq_root)
+    [[ -n "$vdir" ]] && search+=("$vdir")
+    [[ -n "$qroot" ]] && search+=("$qroot")
+    [[ ${#search[@]} -eq 0 ]] && search+=(/nonexistent)
+    bc=$(find "${search[@]}" -name broadcast-core.so -print -quit 2>/dev/null)
+    av=$(find "${search[@]}" -name libAVSDKPlugin.so -print -quit 2>/dev/null)
+    wrapper=$(ls "$vdir/wrapper.node" "$qroot/resources/app/wrapper.node" 2>/dev/null | head -1)
     if [[ -z "$bc" ]]; then
         bad "找不到 broadcast-core.so（QQ 版本目录: ${vdir:-?}）"
     else
@@ -113,7 +133,7 @@ doctor() {
             || note "共享电脑声音：查询方式变了，可能无声"
     fi
     # 窗口几何为空时的崩溃检查（见 qq-wl-portal.c「6.」）：特征码必须恰好出现一次
-    local qqbin=/opt/QQ/qq offs
+    local qqbin="$qroot/qq" offs
     if [[ -f "$qqbin" ]]; then
         offs=$(LC_ALL=C grep -obaF $'\x44\x8b\x7e\x08\x45\x85\xff\x74' "$qqbin" 2>/dev/null | cut -d: -f1)
         if [[ "$offs" =~ ^[0-9]+$ ]] &&
@@ -206,7 +226,7 @@ esac
 
 QQ=$(find_qq)
 if [[ -z "$QQ" ]]; then
-    echo "linuxqq-wayland-fix: 找不到 QQ（linuxqq 或 /opt/QQ/qq），可用 QQ_WAYLAND_FIX_QQ 指定" >&2
+    echo "linuxqq-wayland-fix: 找不到 QQ（linuxqq、qq 或 /opt/QQ/qq），可用 QQ_WAYLAND_FIX_QQ 指定" >&2
     exit 1
 fi
 

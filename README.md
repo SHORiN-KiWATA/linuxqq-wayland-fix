@@ -25,6 +25,46 @@ sudo pacman -U ./linuxqq-wayland-fix-*.pkg.tar.zst              # Arch（需先�
 
 QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
 
+### NixOS / Nix（flake）
+
+本仓库自带 `flake.nix`，从 GitHub 按 commit 构建，`nix flake update`（或 `nix profile upgrade`）即可更新到最新。
+
+临时试用：
+
+```bash
+nix run github:xiaoyintx/linuxqq-wayland-fix
+# 或装进 profile：
+nix profile install github:xiaoyintx/linuxqq-wayland-fix
+```
+
+写进 NixOS / Home Manager 配置：
+
+```nix
+{
+  inputs.linuxqq-wayland-fix = {
+    url = "github:xiaoyintx/linuxqq-wayland-fix";
+    # 与系统共用 nixpkgs，避免重复的 glib / QQ。（可选，但推荐）
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+}
+```
+
+```nix
+# 直接装包
+home.packages = [
+  inputs.linuxqq-wayland-fix.packages.${pkgs.stdenv.hostPlatform.system}.default
+];
+
+# 或引用模块
+# imports = [ inputs.linuxqq-wayland-fix.homeManagerModules.default ];
+# programs.linuxqq-wayland-fix.enable = true;
+
+# 或通过 overlay 使用 pkgs.linuxqq-wayland-fix
+# nixpkgs.overlays = [ inputs.linuxqq-wayland-fix.overlays.default ];
+```
+
+QQ 本体是 unfree，需要 `nixpkgs.config.allowUnfree = true;`。安装后从「QQ（Wayland修复版）」启动，用法与其它发行版一致。
+
 ### 从源码
 
 依赖：C 编译器、make、pkg-config、wayland-scanner，以及 glib2（gio）、libX11、libwayland-client 的开发文件；libpulse、libpipewire-0.3 的开发文件（只用头文件，运行时不依赖）。
