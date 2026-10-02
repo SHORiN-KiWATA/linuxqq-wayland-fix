@@ -175,14 +175,34 @@ doctor() {
     else
         note "没有 wayland-info，跳过剪贴板协议检查（安装 wayland-utils 可检查）"
     fi
-    local ee
+    # Easy Effects 的排除名单在 [StreamInputs] / [StreamOutputs] 的 blocklist=（逗号分隔）。
+    # 提到 TRAE 但键不是 blocklist 的行（如 exclude=）Easy Effects 不读，单独指出来，免得用户以为配过了。
+    local ee res missing wrong
     for ee in "$HOME/.var/app/com.github.wwmm.easyeffects/config/easyeffects/db/easyeffectsrc" \
               "${XDG_CONFIG_HOME:-$HOME/.config}/easyeffects/db/easyeffectsrc"; do
         [[ -f "$ee" ]] || continue
-        if [[ $(grep -c '^blocklist=.*\bTRAE\b' "$ee") -ge 2 ]]; then
-            pass "Easy Effects 已排除 QQ（TRAE）"
+        res=$(awk -F= '
+            /^\[/ { sec = $0; next }
+            sec != "[StreamInputs]" && sec != "[StreamOutputs]" { next }
+            $1 == "blocklist" {
+                n = split(substr($0, length($1) + 2), a, ",")
+                for (i = 1; i <= n; i++) if (a[i] == "TRAE") ok[sec] = 1
+                next
+            }
+            /TRAE/ { print "wrong " $1 }
+            END {
+                if (!ok["[StreamInputs]"]) print "missing 输入"
+                if (!ok["[StreamOutputs]"]) print "missing 输出"
+            }' "$ee")
+        wrong=$(awk '$1 == "wrong" { print $2 "=" }' <<<"$res" | sort -u | paste -sd' ')
+        missing=$(awk '$1 == "missing" { printf "「%s」", $2 }' <<<"$res")
+        if [[ -n "$wrong" ]]; then
+            note "Easy Effects 配置里有 $wrong 写着 TRAE，但 Easy Effects 不读这个键，不会生效；排除名单的键是 blocklist=，请在界面里添加，或删掉这些行（$ee）"
+        fi
+        if [[ -n "$missing" ]]; then
+            note "检测到 Easy Effects：请在$missing的排除名单里加上 TRAE，否则 QQ 一开通话/共享就会崩（$ee）"
         else
-            note "检测到 Easy Effects：请在「输入」「输出」的排除名单里都加上 TRAE，否则 QQ 一开通话/共享就会崩（$ee）"
+            pass "Easy Effects 已排除 QQ（TRAE）"
         fi
     done
     if systemctl --user is-active -q linuxqq-clipsync 2>/dev/null || pgrep -f "(^|/)linuxqq-clipsync( |$)" >/dev/null; then
