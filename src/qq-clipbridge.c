@@ -110,6 +110,23 @@ static Display *xdpy;
 static Window xwin;
 static Atom A_CLIPBOARD, A_TARGETS, A_INCR, A_PROP, A_UTF8, A_GNOME_FILES;
 
+/*
+ * 请求方（SelectionRequest->requestor）可能在收到应答前就销毁窗口，这时对它
+ * XChangeProperty / XSendEvent 会得到 BadWindow。libX11 的默认错误处理会直接
+ * exit(1)，把整个 QQ 一起带走。后台线程的 X 连接只做剪贴板搬运，这里接管错误：
+ * 属于本连接的忽略掉，其它连接的仍交给原有处理（没有就忽略，避免终止进程）。
+ */
+static XErrorHandler prev_x_error_handler;
+
+static int clip_x_error(Display *dpy, XErrorEvent *e)
+{
+    if (dpy == xdpy)
+        return 0;
+    if (prev_x_error_handler)
+        return prev_x_error_handler(dpy, e);
+    return 0;
+}
+
 /* 等待期间收到的 SelectionRequest（QQ 来要我们提供的 Wayland 内容）先存起来，回主循环再处理。 */
 #define MAX_PENDING 16
 static XSelectionRequestEvent pending[MAX_PENDING];
@@ -863,6 +880,7 @@ static void *worker(void *arg)
         LOG("cannot connect: X=%p wayland=%p", (void *)xdpy, (void *)wdpy);
         return NULL;
     }
+    prev_x_error_handler = XSetErrorHandler(clip_x_error);
     xwin = XCreateSimpleWindow(xdpy, DefaultRootWindow(xdpy), 0, 0, 1, 1, 0, 0, 0);
     XSelectInput(xdpy, xwin, PropertyChangeMask);
     A_CLIPBOARD = XInternAtom(xdpy, "CLIPBOARD", False);
