@@ -32,9 +32,9 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
 临时试用：
 
 ```bash
-nix run github:xiaoyintx/linuxqq-wayland-fix
+nix run github:SHORiN-KiWATA/linuxqq-wayland-fix
 # 或装进 profile：
-nix profile install github:xiaoyintx/linuxqq-wayland-fix
+nix profile install github:SHORiN-KiWATA/linuxqq-wayland-fix
 ```
 
 在 flake 的 `inputs` 里加上：
@@ -42,7 +42,7 @@ nix profile install github:xiaoyintx/linuxqq-wayland-fix
 ```nix
 inputs = {
   linuxqq-wayland-fix = {
-    url = "github:xiaoyintx/linuxqq-wayland-fix";
+    url = "github:SHORiN-KiWATA/linuxqq-wayland-fix";
     # 与系统共用 nixpkgs，避免重复的 glib / QQ（可选，但推荐）
     inputs.nixpkgs.follows = "nixpkgs";
   };
