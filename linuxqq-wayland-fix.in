@@ -12,6 +12,7 @@
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
 #   QQ_CLIPBOARD_FIX_DISABLE=1 关闭剪贴板修复（排查问题用）
 #   QQ_SCREENSHOT_FIX_DISABLE=1 关闭截图防闪退（排查问题用）
+#   QQ_WAYLAND_FIX_OZONE      QQ 界面后端：wayland（默认）或 x11（走 XWayland，规避共享悬浮层定位问题）
 
 set -u
 
@@ -221,7 +222,7 @@ doctor() {
 case "${1:-}" in
     --doctor) doctor; exit $? ;;
     --version) echo "linuxqq-wayland-fix $VERSION"; exit 0 ;;
-    --help|-h) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --help|-h) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 QQ=$(find_qq)
@@ -243,6 +244,12 @@ export LD_PRELOAD="$preload${LD_PRELOAD:+:$LD_PRELOAD}"
 export XDG_SESSION_TYPE=x11
 export MESA_SHADER_CACHE_DISABLE="${MESA_SHADER_CACHE_DISABLE:-true}"
 
+# 界面后端默认用原生 Wayland。共享时悬浮工具栏/参会者面板是普通顶层窗口，Wayland
+# 协议不允许客户端给顶层窗口定位，合成器会自己摆放，位置可能不对（见 README「已知问题」，
+# KDE 可用随附的 KWin 脚本摆正）。某些窗口管理器会采纳 X11 的位置提示，可设
+# QQ_WAYLAND_FIX_OZONE=x11 让 QQ 界面走 XWayland 来规避定位问题。
+OZONE="${QQ_WAYLAND_FIX_OZONE:-wayland}"
+
 keep_crash_records
 { echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $*"; } >"$LOG" 2>/dev/null || LOG=/dev/null
-exec "$QQ" --ozone-platform=wayland "$@" >>"$LOG" 2>&1
+exec "$QQ" --ozone-platform="$OZONE" "$@" >>"$LOG" 2>&1

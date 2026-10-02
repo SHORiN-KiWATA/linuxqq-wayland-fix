@@ -25,11 +25,13 @@
  *      选择框），把真正的 PipeWire fd 和 node id 换进去；断开时关闭 portal 会话。
  *
  * 另外在 QQ 主进程里去掉一处 Chromium 的崩溃检查（窗口几何为空时闪退，issue #1），
- * 见「6. 窗口几何为空时不再闪退」。
+ * 见「6. 窗口几何为空时不再闪退」；并让 AVSDK 拿到逻辑显示器尺寸，修正分数缩放
+ * 下共享覆盖层被放大 s 倍，见「7. 分数缩放：让 AVSDK 拿到逻辑显示器尺寸」。
  *
  * 用法：LD_PRELOAD=libqq-wl-portal.so XDG_SESSION_TYPE=x11 linuxqq ...
  */
 #define _GNU_SOURCE
+#include <X11/Xlib.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -987,3 +989,97 @@ static void geometry_fix_init(void)
         (long)getpid(), (unsigned long)((uintptr_t)s.stub - s.base));
 }
 #endif
+
+/* ---------- 7. 分数缩放：让 AVSDK 拿到逻辑显示器尺寸 ---------- */
+
+/*
+ * libAVSDKPlugin.so 用 XRandR(XRRGetMonitors) 从 X11 拿显示器几何来摆共享覆盖层。
+ * 但 XWayland 的 X11 坐标是物理像素，合成器给 QQ 的窗口坐标是逻辑像素（物理÷缩放），
+ * 于是 AVSDK 把物理尺寸当逻辑尺寸用：缩放 s≠1 时，全屏的内容/边框层被放大 s 倍
+ * （100% 才正好等于屏幕）。
+ *
+ * 这里只对「调用方是 libAVSDKPlugin.so」的调用生效，把返回的每个显示器的
+ * x/y/width/height 除以 s。缩放取自 X11 的 Xft.dpi（KWin 下实测 = 96×s）。
+ * 只在 Wayland 会话里做；真实 X11 会话里 X11 坐标本来就是逻辑坐标，不能改。
+ *
+ * 不影响 libqq-screenshot.so：它自己 dlopen("libXrandr.so.2") 再 dlsym，拿到的是
+ * libXrandr 的原函数（它要物理坐标去拼根窗口画面）。
+ * QQ_WL_SCALE_FIX_DISABLE=1 可单独关掉。
+ */
+
+typedef struct {
+    Atom name;
+    Bool primary, automatic;
+    int noutput;
+    int x, y;
+    unsigned int width, height;
+    unsigned int mwidth, mheight;
+    unsigned long *outputs;
+} QqMonitorInfo; /* 与 XRRMonitorInfo 布局一致，避免引入 libXrandr 头文件 */
+
+typedef QqMonitorInfo *(*xrr_get_monitors_fn)(Display *, Window, Bool, int *);
+
+static int from_avsdk(const void *caller)
+{
+    Dl_info info;
+
+    if (!dladdr(caller, &info) || !info.dli_fname)
+        return 0;
+
+    const char *base = strrchr(info.dli_fname, '/');
+    return !strcmp(base ? base + 1 : info.dli_fname, "libAVSDKPlugin.so");
+}
+
+/* KWin 等合成器把缩放写进 X11 的 Xft.dpi（=96×s），据此还原；读不到就用 1。 */
+static double ui_scale(Display *dpy)
+{
+    const char *res = XResourceManagerString(dpy);
+
+    for (const char *p = res; p && (p = strstr(p, "Xft.dpi")); p += 7) {
+        const char *c = p + 7;
+        while (*c == ' ' || *c == '\t')
+            c++;
+        if (*c != ':')
+            continue;
+        double dpi = strtod(c + 1, NULL);
+        if (dpi > 1)
+            return dpi / 96.0;
+    }
+    return 1.0;
+}
+
+static int scale_i(int v, double s)
+{
+    return (int)(v >= 0 ? v / s + 0.5 : v / s - 0.5);
+}
+
+QqMonitorInfo *XRRGetMonitors(Display *dpy, Window window, Bool get_active, int *nmonitors)
+{
+    static xrr_get_monitors_fn real;
+    if (!real)
+        real = (xrr_get_monitors_fn)dlsym(RTLD_NEXT, "XRRGetMonitors");
+    if (!real)
+        return NULL;
+
+    QqMonitorInfo *m = real(dpy, window, get_active, nmonitors);
+    if (!m || !enabled() || !lookup_env("WAYLAND_DISPLAY"))
+        return m;
+
+    const char *v = lookup_env("QQ_WL_SCALE_FIX_DISABLE");
+    if ((v && *v && strcmp(v, "0")) || !from_avsdk(__builtin_return_address(0)))
+        return m;
+
+    double s = ui_scale(dpy);
+    if (s <= 1.0001 || !nmonitors || *nmonitors <= 0)
+        return m;
+
+    for (int i = 0; i < *nmonitors; i++) {
+        m[i].x = scale_i(m[i].x, s);
+        m[i].y = scale_i(m[i].y, s);
+        m[i].width = (unsigned int)scale_i((int)m[i].width, s);
+        m[i].height = (unsigned int)scale_i((int)m[i].height, s);
+    }
+    LOG("scale fix: %d monitor(s) divided by %.3f (Xft.dpi/96)",
+        (long)getpid(), *nmonitors, s);
+    return m;
+}

@@ -19,9 +19,10 @@ CFLAGS     ?= -O2 -g
 PKG_CONFIG ?= pkg-config
 WAYLAND_SCANNER ?= wayland-scanner
 
-# 屏幕共享修复：只用 libpulse / libpipewire 的头文件，运行时不依赖它们
-SS_CFLAGS  := $(shell $(PKG_CONFIG) --cflags gio-unix-2.0 libpulse libpipewire-0.3)
-SS_LIBS    := $(shell $(PKG_CONFIG) --libs gio-unix-2.0)
+# 屏幕共享修复：只用 libpulse / libpipewire 的头文件，运行时不依赖它们；
+# libX11 用于读 Xft.dpi 还原分数缩放（见 qq-wl-portal.c「7.」）
+SS_CFLAGS  := $(shell $(PKG_CONFIG) --cflags gio-unix-2.0 libpulse libpipewire-0.3 x11)
+SS_LIBS    := $(shell $(PKG_CONFIG) --libs gio-unix-2.0 x11)
 # 剪贴板修复
 CB_CFLAGS  := $(shell $(PKG_CONFIG) --cflags x11 wayland-client)
 CB_LIBS    := $(shell $(PKG_CONFIG) --libs x11 wayland-client)
