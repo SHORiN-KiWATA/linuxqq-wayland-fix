@@ -100,10 +100,11 @@ sudo make install PREFIX=/usr
 
 | 项目     | 要求                                                                                                                                             |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 屏幕共享 | xdg-desktop-portal 的 ScreenCast（niri、KDE、GNOME、wlroots 系都有对应后端）                                                                     |
-| 剪贴板   | 合成器支持 data-control（`ext-data-control-v1` 或 `wlr-data-control-unstable-v1`）：niri、KDE Plasma、Hyprland、sway、labwc 等；**GNOME 不支持** |
-| 截图     | 合成器支持 `wlr-screencopy-unstable-v1`：niri、Hyprland、sway、labwc 等；KDE、GNOME 下截图背景是黑的（不会闪退）                                 |
+| 屏幕共享 | xdg-desktop-portal 的 ScreenCast                                                                     |
+| 剪贴板   | 合成器支持 data-control（`ext-data-control-v1` 或 `wlr-data-control-unstable-v1`）：**GNOME 不支持** |               
 | XWayland | 需要（QQ 的界面流程和剪贴板仍是 X11）                                                                                                            |
+
+>kde plasma上运行异常，暂不支持，原因未明
 
 ## 已知问题
 

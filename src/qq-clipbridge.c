@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
@@ -485,6 +486,114 @@ struct offer_info {
 };
 
 static struct offer_info *current;   /* 当前提供给 X11 的 Wayland 内容 */
+static Window last_owner;            /* 上次处理 Wayland 变化（或 QQ 复制）时 X11 CLIPBOARD 的主人 */
+static volatile Window qq_owner;     /* QQ 自己设置 CLIPBOARD 时用的窗口 */
+
+/* XFixes：别的 X11 程序每次设置 CLIPBOARD（即复制）都会通知，同一个窗口连续复制也会 */
+static int fixes_event_base = -1;
+static Window x11_copy_owner;        /* 最近一次复制的普通 X11 程序的窗口 */
+static struct timespec x11_copy_at;
+typedef struct {                     /* XFixesSelectionNotifyEvent */
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    Window window;
+    int subtype;
+    Window owner;
+    Atom selection;
+    Time timestamp, selection_timestamp;
+} FixesSelectionNotify;
+
+/*
+ * X11 窗口 w 是不是合成器的 X11 剪贴板代理（wlroots / KWin 的 xwm 在合成器进程里，
+ * niri 用的是单独的 xwayland-satellite）。用 XRes 查出窗口所属的进程来判断；
+ * libXRes 运行时 dlopen，拿不到时当作普通程序（宁可不抢，也不把别人的剪贴板弄坏）。
+ */
+typedef struct { XID client; unsigned int mask; } ResClientIdSpec;           /* XResClientIdSpec */
+typedef struct { ResClientIdSpec spec; long length; void *value; } ResClientIdValue;  /* XResClientIdValue */
+#define RES_CLIENT_ID_PID_MASK 2                                                 /* XRES_CLIENT_ID_PID_MASK */
+
+static pid_t window_pid(Window w)
+{
+    static int (*query)(Display *, long, ResClientIdSpec *, long *, ResClientIdValue **);
+    static pid_t (*get_pid)(ResClientIdValue *);
+    static void (*destroy)(long, ResClientIdValue *);
+    static int loaded;
+
+    if (!loaded) {
+        loaded = 1;
+        void *h = dlopen("libXRes.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (h) {
+            query = dlsym(h, "XResQueryClientIds");
+            get_pid = dlsym(h, "XResGetClientPid");
+            destroy = dlsym(h, "XResClientIdsDestroy");
+        }
+    }
+    if (!query || !get_pid || !destroy)
+        return -1;
+    ResClientIdSpec spec = { w, RES_CLIENT_ID_PID_MASK };
+    long n = 0;
+    ResClientIdValue *ids = NULL;
+    pid_t pid = -1;
+    if (query(xdpy, 1, &spec, &n, &ids) == Success) {
+        for (long i = 0; i < n && pid < 0; i++)
+            pid = get_pid(&ids[i]);
+        destroy(n, ids);
+    }
+    return pid;
+}
+
+static int is_bridge_window(Window w)
+{
+    pid_t pid = window_pid(w);
+    if (pid <= 0)
+        return 0;
+
+    static pid_t compositor = -1;
+    if (compositor < 0) {
+        struct ucred cred;
+        socklen_t len = sizeof(cred);
+        compositor = getsockopt(wl_display_get_fd(wdpy), SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0
+                         ? cred.pid : 0;
+    }
+    if (pid == compositor)
+        return 1;
+
+    char path[64], comm[64] = "";
+    snprintf(path, sizeof(path), "/proc/%d/comm", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fgets(comm, sizeof(comm), f))
+            comm[strcspn(comm, "\n")] = 0;
+        fclose(f);
+    }
+    return !strcmp(comm, "xwayland-satell");   /* comm 最长 15 个字符 */
+}
+
+/* 记下「普通 X11 程序（包括 QQ 自己）刚复制」，供 dev_selection 判断随后的 Wayland 变化是不是同步过来的 */
+static void note_x11_owner(Window owner)
+{
+    if (owner == None || owner == xwin || (owner != qq_owner && is_bridge_window(owner)))
+        return;
+    x11_copy_owner = owner;
+    clock_gettime(CLOCK_MONOTONIC, &x11_copy_at);
+}
+
+/* 先处理已经到达的 XFixes 通知（主循环每轮先处理 Wayland 事件，再处理 X 事件） */
+static void drain_fixes(void)
+{
+    XEvent ev;
+    while (fixes_event_base >= 0 && XCheckTypedEvent(xdpy, fixes_event_base, &ev))
+        note_x11_owner(((FixesSelectionNotify *)&ev)->owner);
+}
+
+static int ms_since(const struct timespec *t)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int)((now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000);
+}
 
 static void info_free(struct offer_info *info)
 {
@@ -538,6 +647,10 @@ static void dev_selection(void *d, struct ext_data_control_device_v1 *dev,
     if (!info)
         return;
 
+    /* 先往返一次（XGetSelectionOwner），把已经发出的 XFixes 通知读进队列，再处理它们 */
+    Window owner = XGetSelectionOwner(xdpy, A_CLIPBOARD);
+    drain_fixes();
+
     /*
      * 连上 Wayland 时会先收到一次「当前剪贴板」。这时若 X11 剪贴板已经有主人（比如 QQ 刚复制过），
      * 它的内容可能更新，不去抢；之后的变化通知一定比 X11 上的新，照常接管。
@@ -545,15 +658,46 @@ static void dev_selection(void *d, struct ext_data_control_device_v1 *dev,
     static int initial = 1;
     if (initial) {
         initial = 0;
-        Window owner = XGetSelectionOwner(xdpy, A_CLIPBOARD);
+        last_owner = owner;
         if (owner != None && owner != xwin) {
             LOG("startup: X11 clipboard already owned, keep it");
             return;
         }
     }
 
+    /*
+     * 这次 Wayland 变化是合成器（xwayland-satellite、KWin、wlroots）在同步某个 X11 程序的复制
+     * （X11 窗口有焦点时它们会这样做）时，X11 一侧本来就是对的，不能去抢：抢了之后合成器又会
+     * 把我们同步回 Wayland，来回循环，谁都读不到内容。判断依据：
+     *   - 普通 X11 程序刚设置过 CLIPBOARD（XFixes 通知，1.5 秒内）且仍是主人，一次复制可能被同步多次；
+     *   - 格式里有 TIMESTAMP / TARGETS / MULTIPLE 这类 X11 才有的名字（satellite 会原样转过来）；
+     *   - 没有 XFixes 时退而求其次：主人刚换成了别的 X11 程序。
+     * 主人若是合成器自己的代理窗口（它在把 Wayland 内容同步给 X11，但不一定能用），照常接管。
+     * QQ 自己刚复制时同理：随后 1.5 秒内的 Wayland 变化是在同步 QQ 的复制，不能从 QQ 手里抢。
+     */
+    int x11_names = info_has(info, "TIMESTAMP") || info_has(info, "TARGETS") || info_has(info, "MULTIPLE");
+    int recent = owner == x11_copy_owner && ms_since(&x11_copy_at) < 1500;
+    if (owner != None && owner != xwin &&
+        (recent ||
+         (owner != qq_owner && (x11_names || (fixes_event_base < 0 && owner != last_owner)) &&
+          !is_bridge_window(owner)))) {
+        last_owner = owner;
+        LOG("Wayland clipboard follows X11 client 0x%lx, leave X11 as is", (unsigned long)owner);
+        return;
+    }
+
+    /*
+     * 已经是 X11 剪贴板的主人时只更新内容，不重新 SetSelectionOwner：每次换主人，satellite、
+     * fcitx5 等监听 X11 剪贴板的程序都会来读、甚至写回 Wayland，又触发我们，形成来回。
+     * QQ 粘贴时总会来要数据，拿到的就是最新的内容。
+     */
+    if (owner == xwin) {
+        LOG("Wayland clipboard changed, X11 already ours: updated content");
+        return;
+    }
     XSetSelectionOwner(xdpy, A_CLIPBOARD, xwin, CurrentTime);
     XFlush(xdpy);
+    last_owner = xwin;
     char list[512] = "";
     for (int i = 0; i < info->n && strlen(list) + strlen(info->mimes[i]) + 2 < sizeof(list); ++i) {
         strcat(list, info->mimes[i]);
@@ -636,6 +780,8 @@ static long build_x_targets(Atom *out, long cap)
 {
     long n = 0;
     out[n++] = A_TARGETS;
+    /* 带上私有标记：合成器若把我们的 X11 剪贴板同步回 Wayland，dev_selection 能认出来并忽略 */
+    out[n++] = XInternAtom(xdpy, MARKER_MIME, False);
     int text = 0, uris = 0;
     for (int i = 0; current && i < current->n && n < cap - 8; ++i) {
         const char *m = current->mimes[i];
@@ -775,6 +921,8 @@ static void handle_x_events(void)
         XNextEvent(xdpy, &ev);
         if (ev.type == SelectionRequest)
             serve_request(&ev.xselectionrequest);
+        else if (fixes_event_base >= 0 && ev.type == fixes_event_base)
+            note_x11_owner(((FixesSelectionNotify *)&ev)->owner);
         while (n_pending > 0) {
             XSelectionRequestEvent req = pending[--n_pending];
             serve_request(&req);
@@ -824,6 +972,7 @@ static void on_qq_copy(void)
         free(data);
         return;
     }
+    last_owner = XGetSelectionOwner(xdpy, A_CLIPBOARD);
     build_offers((Atom *)data, n / sizeof(Atom));
     free(data);
 
@@ -890,6 +1039,18 @@ static void *worker(void *arg)
     A_UTF8 = XInternAtom(xdpy, "UTF8_STRING", False);
     A_GNOME_FILES = XInternAtom(xdpy, "x-special/gnome-copied-files", False);
 
+    /* libXfixes 运行时 dlopen，不增加链接依赖；没有时退回较粗的判断 */
+    void *fx = dlopen("libXfixes.so.3", RTLD_LAZY | RTLD_LOCAL);
+    Bool (*fx_query)(Display *, int *, int *) = fx ? dlsym(fx, "XFixesQueryExtension") : NULL;
+    void (*fx_select)(Display *, Window, Atom, unsigned long) = fx ? dlsym(fx, "XFixesSelectSelectionInput") : NULL;
+    int fx_event, fx_error;
+    if (fx_query && fx_select && fx_query(xdpy, &fx_event, &fx_error)) {
+        fixes_event_base = fx_event;   /* XFixesSelectionNotify = 事件基数 + 0 */
+        fx_select(xdpy, DefaultRootWindow(xdpy), A_CLIPBOARD, 1 /* XFixesSetSelectionOwnerNotifyMask */);
+    } else {
+        LOG("XFixes unavailable, X11-copy detection is less precise");
+    }
+
     struct wl_registry *reg = wl_display_get_registry(wdpy);
     wl_registry_add_listener(reg, &reg_listener, NULL);
     wl_display_roundtrip(wdpy);
@@ -953,6 +1114,10 @@ int XSetSelectionOwner(Display *dpy, Atom selection, Window owner, Time t)
             cached_dpy = dpy;
         }
         if (selection == cached_clipboard) {
+            /* 当场记下「QQ 刚复制」：合成器把它同步回 Wayland 的事件可能比 XFixes 通知先到 */
+            qq_owner = owner;
+            x11_copy_owner = owner;
+            clock_gettime(CLOCK_MONOTONIC, &x11_copy_at);
             __atomic_add_fetch(&copy_generation, 1, __ATOMIC_SEQ_CST);
             wake();
         }

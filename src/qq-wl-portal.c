@@ -58,8 +58,6 @@
 #define PORTAL_PATH "/org/freedesktop/portal/desktop"
 #define SCREENCAST_IFACE "org.freedesktop.portal.ScreenCast"
 
-extern char **environ;
-
 /* ---------- 调用方判断 ---------- */
 
 static int from_broadcast_core(const void *caller)
@@ -95,14 +93,27 @@ static int enabled(void)
 
 /* ---------- 1. getenv ---------- */
 
+/*
+ * 交给加载顺序在我们之后的那个 getenv（RTLD_NEXT），不一定是 libc 的：
+ * flatpak 版 QQ 由 zypak 启动，zypak 在沙盒子进程里自己也替换了 getenv（据此伪装 getpid
+ * 通过 Chromium 的沙盒自检），而 ZYPAK_LD_PRELOAD 里的库排在它前面。自己遍历 environ
+ * 或直接取 libc 的版本都会绕过它，沙盒中的 zygote 就起不来（Failed sending zygote boot message）。
+ *
+ * 我们拦截了 dlsym，所以先用 dlvsym 取真正的 dlsym，再从本库里调用它，RTLD_NEXT 才以本库为起点。
+ */
 static char *lookup_env(const char *name)
 {
-    size_t n = strlen(name);
+    static char *(*next)(const char *);
 
-    for (char **e = environ; e && *e; ++e)
-        if (!strncmp(*e, name, n) && (*e)[n] == '=')
-            return *e + n + 1;
-    return NULL;
+    if (!next) {
+        void *(*real_dlsym)(void *, const char *) =
+            (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+        if (!real_dlsym)
+            real_dlsym = (void *(*)(void *, const char *))dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+        if (real_dlsym)
+            next = (char *(*)(const char *))real_dlsym(RTLD_NEXT, "getenv");
+    }
+    return next && name ? next(name) : NULL;
 }
 
 char *getenv(const char *name)
@@ -111,7 +122,7 @@ char *getenv(const char *name)
         from_broadcast_core(__builtin_return_address(0)))
         return (char *)"wayland";
 
-    return name ? lookup_env(name) : NULL;
+    return lookup_env(name);
 }
 
 /* ---------- 3. portal 流程 ---------- */
