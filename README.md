@@ -128,12 +128,6 @@ QQ 的截图窗口是按「放在桌面左上角、和整个桌面一样大」�
 
 QQ 为 X11 设计的共享边框在 Wayland 下会变成一个真实的全屏窗口，目前没有处理，可以在合成器里把它挪到别的工作区。
 
-### 共享悬浮工具栏/参会者面板位置不对
-
-共享时这几个悬浮窗口是 QQ 的普通 Wayland 顶层窗口，协议不允许客户端给顶层窗口定位，位置由合成器决定，部分合成器会摆错。**KDE Plasma 6** 可以用仓库里的 [`kwin-script/`](kwin-script/README.md) 脚本摆正；其它合成器需要各自的窗口规则。也可以设 `QQ_WAYLAND_FIX_OZONE=x11` 让 QQ 界面走 XWayland 来规避。
-
-（内容/边框层在分数缩放下被放大 s 倍的问题，注入库已自动处理，无需配置。）
-
 ### 流畅度
 
 共享画面由 QQ 单线程软件 H.264 编码，帧率由 QQ 自己的策略决定，本项目无法改善。在选择框里选**单个窗口**会更流畅。
@@ -184,7 +178,7 @@ grep -E 'qq-wl-portal|qq-clipbridge' "$XDG_RUNTIME_DIR/linuxqq-wayland-fix.log"
 
 **截图（`libqq-screenshot.so`）**：启动器为了让屏幕共享可用，给 QQ 的是 `XDG_SESSION_TYPE=x11`，于是 QQ 用 X11 的方式对根窗口 `XGetImage` 截全屏；而 Wayland 下的 XWayland 是 rootless 的，根窗口没有内容，这一步必然失败，QQ 不检查返回值就直接崩溃。本库拦截对根窗口的截取，改为通过 `wlr-screencopy` 截取各个 Wayland 输出，按 X 的显示器布局拼好交给 QQ；合成器不支持时给一张黑图，至少不再闪退。
 
-**界面后端**：默认 `--ozone-platform=wayland`。共享时的悬浮工具栏/参会者面板是 QQ 的普通 Wayland 顶层窗口，Wayland 协议不允许客户端给顶层窗口定位，位置由合成器决定；部分合成器会摆错（KDE 可用随附的 KWin 脚本摆正，见下）。想改走 XWayland（X11 的位置提示多数窗口管理器会采纳）可设 `QQ_WAYLAND_FIX_OZONE=x11`。
+**界面后端**：启动器默认让 QQ 界面走 XWayland（`--ozone-platform=x11`）。共享时的悬浮工具栏和「当前无成员发言」面板是 QQ 的普通顶层窗口，而 Wayland 协议不允许客户端给顶层窗口定位，合成器会把它们层叠到任意位置；走 X11 后位置提示会被多数窗口管理器采纳，工具栏就能落在共享区域顶部居中。想用原生 Wayland 界面可设 `QQ_WAYLAND_FIX_OZONE=wayland`。
 
 详细的逆向分析见 [docs/原理详解.md](docs/原理详解.md)。
 
