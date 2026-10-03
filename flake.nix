@@ -20,7 +20,7 @@
       # 上游没有 VERSION 文件（Makefile 用 git describe 兜底），这里换成 git revision，
       # 这样 linuxqq-wayland-fix --doctor 和日志里能看到具体的构建版本。
       # 同步上游发版时改这一行（对应上游 tag vX.Y.Z）。
-      upstreamVersion = "0.2.7";
+      upstreamVersion = "0.2.8";
 
       version =
         if self ? shortRev then
