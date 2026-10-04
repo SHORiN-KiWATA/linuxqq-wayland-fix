@@ -276,17 +276,35 @@ screenshot_helper_desktop() {
 # 当前档位可以读出来 —— wpctl inspect 的 api.bluez5.profile：a2dp-sink 是听歌档，
 # headset-head-unit / 带 hfp 的是通话档，后者正处在"一用麦就重建图"的路径上。
 # 输出：有线数 蓝牙数 蓝牙档位（读不到就是空串）
+# 统计"在线"的音频输出。
+#
+# 只认真正在 PipeWire 图里的 sink：先取 wpctl status 里所有 id，再对每个 id 跑
+# wpctl inspect，用 media.class = "Audio/Sink" + node.name 前缀（alsa_output. /
+# bluez_output.）判定。不能直接 grep wpctl status 的输出：末尾的
+# "Default Configured Devices" 会把 WirePlumber 记住的默认设备（比如以前配过的
+# 蓝牙耳机）也数进来，而在线 sink 在 wpctl status 里显示的是描述文字、不是 node.name。
 audio_graph_outputs() {
     command -v wpctl >/dev/null 2>&1 || return 1
     local st
     st=$(wpctl status 2>/dev/null) || return 1
-    local wired bt prof="" id
-    wired=$(printf '%s\n' "$st" | grep -c 'alsa_output')
-    bt=$(printf '%s\n' "$st" | grep -c 'bluez_output')
-    if [[ "$bt" -gt 0 ]]; then
-        id=$(printf '%s\n' "$st" | grep 'bluez_output' | grep -oE '[0-9]+\.' | head -1 | tr -d '.')
-        [[ -n "$id" ]] && prof=$(wpctl inspect "$id" 2>/dev/null | grep 'api.bluez5.profile' | head -1 | sed 's/.*= *//; s/"//g')
-    fi
+    local wired=0 bt=0 prof="" id info
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        info=$(wpctl inspect "$id" 2>/dev/null) || continue
+        case "$info" in
+        *'media.class = "Audio/Sink"'*) ;;
+        *) continue ;;
+        esac
+        case "$info" in
+        *'node.name = "alsa_output.'*) wired=$((wired + 1)) ;;
+        *'node.name = "bluez_output.'*)
+            bt=$((bt + 1))
+            if [[ -z "$prof" ]]; then
+                prof=$(printf '%s\n' "$info" | grep 'api.bluez5.profile' | head -1 | sed 's/.*= *//; s/"//g')
+            fi
+            ;;
+        esac
+    done < <(printf '%s\n' "$st" | grep -oE '^[^0-9]*[0-9]+\.' | grep -oE '[0-9]+')
     printf '%s %s %s\n' "$wired" "$bt" "$prof"
 }
 
