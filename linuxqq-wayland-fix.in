@@ -330,8 +330,14 @@ last_negotiated_fps() {
         grep 'framerate: spa_fraction { num:' | tail -1)
     [[ -n "${line:-}" ]] || return 0
     ep=${line%% *}
-    rate=$(printf '%s' "$line" | grep -oE 'framerate: spa_fraction \{ num: [0-9]+' |
-        head -1 | grep -oE '[0-9]+$')
+    local frac num den
+    frac=$(printf '%s' "$line" | grep -oE '(^|[^_])framerate: spa_fraction \{ num: [0-9]+, denom: [0-9]+' |
+        head -1)
+    num=$(printf '%s' "$frac" | grep -oE 'num: [0-9]+' | head -1 | grep -oE '[0-9]+')
+    den=$(printf '%s' "$frac" | grep -oE 'denom: [0-9]+' | head -1 | grep -oE '[0-9]+')
+    if [[ -n "${num:-}" && -n "${den:-}" && "${den:-0}" != 0 ]]; then
+        rate=$(((num + den / 2) / den))    # 24/1→24，24000/1001→24
+    fi
     printf '%s %s\n' "${ep%%.*}" "${rate:-0}"
 }
 
@@ -559,8 +565,10 @@ doctor() {
     if clipboard_auto_disabled; then
         note "剪贴板：KDE Plasma 自带 XWayland 剪贴板同步，本修复已默认禁用（QQ 剪贴板照常可用）"
     elif command -v wayland-info >/dev/null 2>&1; then
-        local wi; wi=$(wayland-info 2>/dev/null)
-        if grep -q ext_data_control_manager_v1 <<< "$wi"; then
+        local wi; wi=$(timeout 15 wayland-info 2>/dev/null)
+        if [[ -z "$wi" ]]; then
+            note "wayland-info 没有返回接口列表（合成器无响应或环境异常），跳过剪贴板协议检查"
+        elif grep -q ext_data_control_manager_v1 <<< "$wi"; then
             pass "剪贴板：合成器支持 ext-data-control"
         elif grep -q zwlr_data_control_manager_v1 <<< "$wi"; then
             pass "剪贴板：合成器支持 wlr-data-control"
@@ -653,10 +661,17 @@ doctor() {
         note "拿不到合成器全局接口列表（没装 wayland-utils，或合成器没响应），跳过协议探测"
     else
         pass "合成器宣告了 $(printf '%s\n' "$wl_globals" | wc -l) 个全局接口"
-        if printf '%s\n' "$wl_globals" | grep -qE '^zwlr_export_dmabuf_manager_v1$'; then
-            pass "宣告 DMA-BUF 导出（可零拷贝采集）"
+        # 有没有导出类协议只是「前提」，不能据此断言采集走不走零拷贝：本机就同时
+        # 宣告了 zwp_linux_dmabuf_v1 与 ext_image_copy_capture_manager_v1。真正作数
+        # 的是 portal/PipeWire 的格式协商，niri 会把它写进 journal。
+        if printf '%s\n' "$wl_globals" | grep -qE '^(zwlr_export_dmabuf_manager_v1|zwlr_screencopy_manager_v1|ext_image_copy_capture_manager_v1)$'; then
+            pass "合成器有导出/图像拷贝类采集协议（具备零拷贝采集的前提）"
         else
-            note "不宣告 DMA-BUF 导出：采集只能走 SHM 拷贝，共享占用记在系统内存（Shmem）里"
+            note "合成器没有导出/图像拷贝类采集协议，零拷贝采集的前提不成立"
+        fi
+        if [[ "${XDG_CURRENT_DESKTOP:-}" == *niri* ]] && command -v journalctl >/dev/null 2>&1 &&
+            journalctl --user -u niri.service --since '-30min' --no-pager 2>/dev/null | grep -q 'negotiated inefficient shm stream'; then
+            note "实测协商走 SHM 拷贝（journal：negotiated inefficient shm stream）：共享占用记在系统内存（Shmem）里"
         fi
     fi
 
@@ -741,7 +756,7 @@ doctor() {
                 pass "shmem 大页策略 $shmem_thp（与内核命令行 $cmd_thp 一致）"
             else
                 note "内核命令行写着 $cmd_thp，实际策略是 $shmem_thp —— 这个参数被内核丢掉了"
-                printf '       被丢掉的参数不会报错，只在 dmesg 里有一行 "transparent_hugepage= cannot parse, ignored"。\n'
+                printf '       被丢掉的参数不会报错，只在 dmesg 里留一行 "transparent_hugepage= cannot parse, ignored"（读 dmesg 需要权限）。\n'
                 printf '       要真的改掉，开机后写 sysfs，例如放 /etc/tmpfiles.d/thp-shmem.conf：\n'
                 printf '       w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - never\n'
             fi
@@ -764,7 +779,8 @@ doctor() {
         bad "QQ（PID $pid）没有注入：请完全退出 QQ（含托盘），再从「QQ（Wayland修复版）」打开"
     fi
     # 逐进程审计：真正收帧的是 --type=ppapi 那个进程，它没被注入就等于没修。
-    # QQ 自己也带 libqq-*.so，所以判据是「四个库缺哪个」，不是数够四个。
+    # 判据是「四个库缺哪个」，不是数够四个：进程里可能还注入了别的 libqq-*.so
+    # （例如实验用的 libqq-nvenc.so），数个数会把缺库误判成齐全。
     # 其它子进程按需注入，缺库不一定致命，所以只列前两条异常的，其余合计。
     if [[ -n "$pid" ]]; then
         local qqpids ppapi="" p missing others=0 others_ok=0 shown=0 more=0
