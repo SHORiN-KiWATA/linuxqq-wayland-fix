@@ -23,6 +23,15 @@ set -u
 
 VERSION="@VERSION@"
 LIBDIR="@LIBEXECDIR@"
+# 直接从源码树跑（还没 make、也没装包）时，上面两个占位符还没被替换成真值：库路径类检查
+# 没法进行，这时明确降级为「跳过」，而不是报一串「找不到 …/libqq-wl-portal.so」的假失败。
+# 判据写成 "@*@"：不能写出占位符的字面量 —— Makefile 的替换会把文件里每一处字面量都换掉，
+# 那样连上面的 case 模式本身都会被替换成实际值，装好的脚本反而永远判定为「未构建」。
+# 同时它也不会把安装路径里合法含 "@" 的情况（自建前缀等）误判成模板 —— 否则「库真的没装」
+# 会被一并跳过，而那正是自检要抓的东西。
+TEMPLATE_UNBUILT=""
+case "$VERSION" in @*@) TEMPLATE_UNBUILT=1 ;; esac
+case "$LIBDIR" in @*@) TEMPLATE_UNBUILT=1 ;; esac
 SCREENSHARE_LIB="$LIBDIR/libqq-wl-portal.so"
 CLIPBOARD_LIB="$LIBDIR/libqq-clipbridge.so"
 SCREENSHOT_LIB="$LIBDIR/libqq-screenshot.so"
@@ -268,13 +277,116 @@ screenshot_helper_desktop() {
     return 1
 }
 
+# 音频图：有线和蓝牙输出同时在线时，WirePlumber 会在两者之间切换默认设备，
+# PipeWire 随之重建整个图，采集/通话客户端手里的 node 句柄失效 —— 共享会突然没画面，
+# 通话也可能挂不断。
+#
+# 蓝牙单独在线时同样会断：通话（用麦）会把蓝牙从 A2DP 切到 HFP，PipeWire 一样重建图。
+# 当前档位可以读出来 —— wpctl inspect 的 api.bluez5.profile：a2dp-sink 是听歌档，
+# headset-head-unit / 带 hfp 的是通话档，后者正处在"一用麦就重建图"的路径上。
+# 输出：有线数 蓝牙数 蓝牙档位（读不到就是空串）
+# 统计"在线"的音频输出。
+#
+# 只认真正在 PipeWire 图里的 sink：先取 wpctl status 里所有 id，再对每个 id 跑
+# wpctl inspect，用 media.class = "Audio/Sink" + node.name 前缀（alsa_output. /
+# bluez_output.）判定。不能直接 grep wpctl status 的输出：末尾的
+# "Default Configured Devices" 会把 WirePlumber 记住的默认设备（比如以前配过的
+# 蓝牙耳机）也数进来，而在线 sink 在 wpctl status 里显示的是描述文字、不是 node.name。
+audio_graph_outputs() {
+    command -v wpctl >/dev/null 2>&1 || return 1
+    local st
+    st=$(wpctl status 2>/dev/null) || return 1
+    local wired=0 bt=0 prof="" id info
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        info=$(wpctl inspect "$id" 2>/dev/null) || continue
+        case "$info" in
+        *'media.class = "Audio/Sink"'*) ;;
+        *) continue ;;
+        esac
+        case "$info" in
+        *'node.name = "alsa_output.'*) wired=$((wired + 1)) ;;
+        *'node.name = "bluez_output.'*)
+            bt=$((bt + 1))
+            if [[ -z "$prof" ]]; then
+                prof=$(printf '%s\n' "$info" | grep 'api.bluez5.profile' | head -1 | sed 's/.*= *//; s/"//g')
+            fi
+            ;;
+        esac
+    done < <(printf '%s\n' "$st" | grep -oE '^[^0-9]*[0-9]+\.' | grep -oE '[0-9]+')
+    printf '%s %s %s\n' "$wired" "$bt" "$prof"
+}
+
+# ---- 采集与内存：合成器能力、帧率是否真的生效、谁在占共享内存 ---------------
+# /proc/meminfo 的 Shmem（普通共享内存 + GPU 侧 system 记账的总和），单位 KiB
+shmem_kib() { awk '/^Shmem:/{print $2+0; exit}' /proc/meminfo 2>/dev/null; }
+
+# journal 里最近一次真实协商到的帧率，返回「epoch 帧率」。帧率要匹配第一个
+# `framerate:` 片段：整行里还有 pixel_aspect_ratio 等别的 num:，贪心匹配会取错。
+last_negotiated_fps() {
+    command -v journalctl >/dev/null 2>&1 || return 0
+    local line ep rate
+    line=$(journalctl --user -u niri.service --since '-30min' --no-pager -o short-unix 2>/dev/null |
+        grep 'framerate: spa_fraction { num:' | tail -1)
+    [[ -n "${line:-}" ]] || return 0
+    ep=${line%% *}
+    local frac num den
+    frac=$(printf '%s' "$line" | grep -oE '(^|[^_])framerate: spa_fraction \{ num: [0-9]+, denom: [0-9]+' |
+        head -1)
+    num=$(printf '%s' "$frac" | grep -oE 'num: [0-9]+' | head -1 | grep -oE '[0-9]+')
+    den=$(printf '%s' "$frac" | grep -oE 'denom: [0-9]+' | head -1 | grep -oE '[0-9]+')
+    if [[ -n "${num:-}" && -n "${den:-}" && "${den:-0}" != 0 ]]; then
+        rate=$(((num + den / 2) / den))    # 24/1→24，24000/1001→24
+    fi
+    printf '%s %s\n' "${ep%%.*}" "${rate:-0}"
+}
+
+# 合成器启动时刻（epoch），用来判断 journal 里的协商记录是不是本次启动之后的。
+compositor_start_epoch() {
+    local ts p
+    if command -v systemctl >/dev/null 2>&1; then
+        # LC_ALL=C: systemd 按 locale 格式化时间戳，中文 locale 下 date -d 解析不了
+        ts=$(LC_ALL=C systemctl --user show niri.service -p ActiveEnterTimestamp --value 2>/dev/null)
+        if [[ -n "${ts:-}" && "$ts" != "n/a" ]]; then
+            LC_ALL=C date -d "$ts" +%s 2>/dev/null && return 0
+        fi
+    fi
+    p=$(pgrep -x niri 2>/dev/null | head -1)
+    [[ -n "${p:-}" ]] && stat -c %Y "/proc/$p" 2>/dev/null
+    return 0
+}
+
 doctor() {
-    local ok=0 warn=0 fail=0
+    local ok=0 warn=0 fail=0 skipped=0
     pass() { printf '  \e[32m✓\e[0m %s\n' "$*"; ok=$((ok + 1)); }
     note() { printf '  \e[33m!\e[0m %s\n' "$*"; warn=$((warn + 1)); }
     bad()  { printf '  \e[31m✗\e[0m %s\n' "$*"; fail=$((fail + 1)); }
+    skip() { printf '  \e[2m-\e[0m %s\n' "$*"; skipped=$((skipped + 1)); }
 
-    echo "linuxqq-wayland-fix $VERSION 自检"
+    # 是否在一个可用的桌面会话里：合成器、会话 D-Bus、PipeWire 都挂在这上面。
+    # 在会话外跑（ssh、tty、systemd 单元里）时，下面那些"够不到"的检查一律跳过 ——
+    # 够不到不等于坏了，报 ✗ 只会把人引去修根本没坏的东西。
+    local in_session=1 sess_why=""
+    if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]]; then
+        in_session=0; sess_why="XDG_RUNTIME_DIR 不可用"
+    elif [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
+        in_session=0; sess_why="WAYLAND_DISPLAY 与 DISPLAY 都没有"
+    elif [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && ! -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]]; then
+        in_session=0; sess_why="连不上会话总线（DBUS_SESSION_BUS_ADDRESS 为空，且 \$XDG_RUNTIME_DIR/bus 不存在）"
+    fi
+    sess() { [[ $in_session -eq 1 ]]; }
+    # 会话外专用的跳过：措辞统一，让人一眼看出是"没环境"而不是"东西坏了"
+    no_sess() { skip "$1（不在桌面会话内，跳过）"; }
+
+    if [[ -n "$TEMPLATE_UNBUILT" ]]; then
+        echo "linuxqq-wayland-fix （未构建模板）自检"
+        note "这是源码树里的模板（版本/库路径占位符未替换）：依赖安装路径的检查标为跳过；完整自检请按 README 构建或装包后再跑"
+    else
+        echo "linuxqq-wayland-fix $VERSION 自检"
+    fi
+    if ! sess; then
+        note "当前不在桌面会话内（$sess_why）：依赖合成器 / D-Bus / PipeWire 的检查会跳过，请在该桌面会话的终端里重跑"
+    fi
     echo
     echo "[基础]"
     local qq; qq=$(find_qq)
@@ -285,39 +397,47 @@ doctor() {
     else
         note "未检测到已安装的 linuxqq / linuxqq-appimage 包（可能手动安装）"
     fi
-    [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
-    if clipboard_auto_disabled; then
-        note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
-    elif [[ -r "$CLIPBOARD_LIB" ]]; then
-        pass "剪贴板修复: $CLIPBOARD_LIB"
+    if [[ -n "$TEMPLATE_UNBUILT" ]]; then
+        skip "屏幕共享修复 / 剪贴板修复 / 截图防闪退 / 窗口修补: 跳过（未构建模板，库路径未替换）"
     else
-        bad "找不到 $CLIPBOARD_LIB"
-    fi
-    [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
-    # 截图链（GNOME）：没有 wlr-screencopy，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
-    # 或 helper 缺失时，截图会静默地全黑，日志里才有原因。KDE 走 KWin ScreenShot2，在后面单独检查。
-    if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
-        local sh_help="$LIBDIR/qq-screenshot-helper" sh_desk
-        if [[ -r "$SCREENSHOT_LIB" ]]; then
-            # 标记用门户路径的开关名：真正发起门户调用的是 helper 进程，库里没有 D-Bus 接口串。
-            # 实测：含门户路径的版本有这个串，0.2.10 之前的没有。
-            if grep -aq 'QQ_SCREENSHOT_PORTAL' "$SCREENSHOT_LIB"; then
-                pass "截图: libqq-screenshot.so 含 GNOME 门户分支"
+        [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
+        if clipboard_auto_disabled; then
+            note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
+        elif [[ -r "$CLIPBOARD_LIB" ]]; then
+            pass "剪贴板修复: $CLIPBOARD_LIB"
+        else
+            bad "找不到 $CLIPBOARD_LIB"
+        fi
+        [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
+        # 截图链（GNOME）：没有 wlr-screencopy，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
+        # 或 helper 缺失时，截图会静默地全黑，日志里才有原因。KDE 走 KWin ScreenShot2，在后面单独检查。
+        if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
+            local sh_help="$LIBDIR/qq-screenshot-helper" sh_desk
+            if [[ -r "$SCREENSHOT_LIB" ]]; then
+                # 标记用门户路径的开关名：真正发起门户调用的是 helper 进程，库里没有 D-Bus 接口串。
+                # 实测：含门户路径的版本有这个串，0.2.10 之前的没有。
+                if grep -aq 'QQ_SCREENSHOT_PORTAL' "$SCREENSHOT_LIB"; then
+                    pass "截图: libqq-screenshot.so 含 GNOME 门户分支"
+                else
+                    bad "截图: 这份 libqq-screenshot.so 没有 GNOME 门户分支（0.2.10 之前的版本），截图会全黑，请升级本包"
+                fi
+            fi
+            [[ -x "$sh_help" ]] && pass "截图: helper 已安装（$sh_help）" \
+                || bad "截图: 缺 qq-screenshot-helper，截图会全黑（重装本包或 make install）"
+            if sh_desk=$(screenshot_helper_desktop); then
+                pass "截图: helper 的 .desktop 已安装（$sh_desk）"
             else
-                bad "截图: 这份 libqq-screenshot.so 没有 GNOME 门户分支（0.2.10 之前的版本），截图会全黑，请升级本包"
+                note "截图: 缺 qq-screenshot-helper.desktop（门户用它认调用者）"
             fi
         fi
-        [[ -x "$sh_help" ]] && pass "截图: helper 已安装（$sh_help）" \
-            || bad "截图: 缺 qq-screenshot-helper，截图会全黑（重装本包或 make install）"
-        if sh_desk=$(screenshot_helper_desktop); then
-            pass "截图: helper 的 .desktop 已安装（$sh_desk）"
-        else
-            note "截图: 缺 qq-screenshot-helper.desktop（门户用它认调用者）"
-        fi
+        [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
     fi
-    [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
-    [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
-    [[ -n "${DISPLAY:-}" ]] && pass "XWayland: $DISPLAY" || bad "DISPLAY 为空：QQ 的界面与剪贴板仍需要 XWayland"
+    if sess; then
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
+        [[ -n "${DISPLAY:-}" ]] && pass "XWayland: $DISPLAY" || bad "DISPLAY 为空：QQ 的界面与剪贴板仍需要 XWayland"
+    else
+        no_sess "Wayland 会话与 XWayland"
+    fi
     case "$(angle_mode)" in
         vulkan) pass "ANGLE 后端: vulkan（检测到 Vulkan，可规避观看共享花屏）" ;;
         swiftshader) note "ANGLE 后端: swiftshader（软件渲染，较慢，由 QQ_WAYLAND_FIX_ANGLE 指定）" ;;
@@ -325,6 +445,39 @@ doctor() {
     esac
 
     echo
+    echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
+    local ag
+    if ! sess; then
+        no_sess "音频图（PipeWire / WirePlumber）"
+    elif ! command -v wpctl >/dev/null 2>&1; then
+        note "没装 wpctl（WirePlumber 的命令行工具），跳过音频图检查"
+    elif ! wpctl status >/dev/null 2>&1; then
+        note "连不上 PipeWire（wpctl 访问不到 PipeWire 服务），跳过音频图检查"
+    elif ag=$(audio_graph_outputs); then
+        local wired bt prof rest
+        wired="${ag%% *}"
+        rest="${ag#* }"
+        bt="${rest%% *}"
+        prof="${rest#* }"
+        if [[ "$wired" -eq 0 && "$bt" -eq 0 ]]; then
+            note "没检测到在线的音频输出（声卡未就绪或都被禁用了）"
+        elif [[ "$wired" -gt 0 && "$bt" -gt 0 ]]; then
+            note "有线和蓝牙音频输出同时在线（有线=$wired 蓝牙=$bt）：WirePlumber 会换默认设备、PipeWire 重建图，共享会突然无画面、通话可能挂不断"
+            echo "      断开其中一个，或 wpctl set-default <输出 id> 钉住默认设备；已经卡住时 systemctl --user restart pipewire wireplumber"
+        elif [[ "$prof" == *headset* || "$prof" == *hfp* ]]; then
+            note "蓝牙输出当前在通话档（api.bluez5.profile=$prof）：通话/用麦会让 PipeWire 重建图，共享会突然无画面、通话可能挂不断"
+            echo "      通话期间别用耳机麦（或让它只留 A2DP 档）；已经卡住时 systemctl --user restart pipewire wireplumber"
+        elif [[ -n "$prof" ]]; then
+            pass "音频图: 有线=$wired 蓝牙=$bt（蓝牙档位 $prof，听歌档；通话切到 HFP 时会重建图）"
+        elif [[ "$bt" -eq 0 && "$wired" -gt 1 ]]; then
+            pass "音频输出: 没有蓝牙输出在线（有线=$wired 个，都在线）"
+        else
+            pass "音频输出: 只有一种在线（有线=$wired 蓝牙=$bt）"
+        fi
+    else
+        note "拿不到 WirePlumber 的设备列表，跳过音频图检查"
+    fi
+
     echo "[QQ 内部实现（QQ 更新后用来判断修复是否还适用）]"
     local vdir rdir bc av wrapper
     vdir=$(qq_version_dir)
@@ -385,7 +538,8 @@ doctor() {
 
     echo
     echo "[桌面环境]"
-    local de="${XDG_CURRENT_DESKTOP:-}" st="${XDG_SESSION_TYPE:-未知}" cv
+    local de="${XDG_CURRENT_DESKTOP:-}" st="${XDG_SESSION_TYPE:-}" cv
+    [[ -z "$st" ]] && st="未设置（不在会话内？）"
     cv=$(compositor_version)
     if [[ -z "$de" ]]; then
         note "桌面环境: 无法识别（XDG_CURRENT_DESKTOP 为空，$st）"
@@ -394,7 +548,9 @@ doctor() {
     else
         pass "桌面环境: $de（$st）"
     fi
-    if command -v busctl >/dev/null 2>&1; then
+    if ! sess; then
+        no_sess "Portal 与屏幕共享（xdg-desktop-portal）"
+    elif command -v busctl >/dev/null 2>&1; then
         local psvc pfile pdbus pown pstate pdesc piface ptypes
         psvc=$(pkg_installed xdg-desktop-portal)
         piface=$(portal_interfaces)
@@ -417,27 +573,44 @@ doctor() {
                 else
                     pass "Portal: ${psvc:-xdg-desktop-portal} 运行中$pdesc"
                 fi
+            elif [[ "$piface" == *ScreenCast* ]]; then
+                # 没有 UseIn 匹配当前桌面的后端配置，不等于共享不可用：接口由默认后端
+                # （-wlr/-gtk 等）提供时 D-Bus 上照样能用，niri 就是这种。
+                pass "Portal: ${psvc:-xdg-desktop-portal} 运行中（无匹配「${XDG_CURRENT_DESKTOP}」的后端配置，ScreenCast 由默认后端提供）"
             elif [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
                 note "Portal: ${psvc:-xdg-desktop-portal} 运行中（未找到匹配「${XDG_CURRENT_DESKTOP}」的后端配置，屏幕共享可能不可用）"
             else
                 pass "Portal: ${psvc:-xdg-desktop-portal} 运行中"
             fi
             pass "Portal 接口: $piface"
+        elif ! busctl --user list >/dev/null 2>&1; then
+            # 够不到会话总线（会话外、或 D-Bus 没起来）不等于 portal 坏了
+            skip "Portal 与屏幕共享（连不上会话总线，跳过）"
         else
             bad "Portal: xdg-desktop-portal 不可用（屏幕共享、GNOME 截图修复将无法工作）"
         fi
         ptypes=$(busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
                 org.freedesktop.portal.ScreenCast AvailableSourceTypes 2>/dev/null | awk '{print $2}')
-        [[ -n "$ptypes" && "$ptypes" != 0 ]] && pass "屏幕共享：portal 录屏可用" \
-            || bad "屏幕共享：xdg-desktop-portal 没有可用的 ScreenCast 实现"
+        if [[ -n "$ptypes" && "$ptypes" != 0 ]]; then
+            pass "屏幕共享：portal 录屏可用"
+        elif ! busctl --user list >/dev/null 2>&1; then
+            # 查不到不等于没有：会话总线够不到时只能跳过
+            skip "屏幕共享：连不上会话总线，无法查询 portal 的 ScreenCast 能力（跳过）"
+        else
+            bad "屏幕共享：xdg-desktop-portal 没有可用的 ScreenCast 实现"
+        fi
     else
         note "没有 busctl，跳过 portal 检查"
     fi
     if clipboard_auto_disabled; then
         note "剪贴板：KDE Plasma 自带 XWayland 剪贴板同步，本修复已默认禁用（QQ 剪贴板照常可用）"
+    elif ! sess; then
+        no_sess "剪贴板协议探测（wayland-info）"
     elif command -v wayland-info >/dev/null 2>&1; then
-        local wi; wi=$(wayland-info 2>/dev/null)
-        if grep -q ext_data_control_manager_v1 <<< "$wi"; then
+        local wi; wi=$(timeout 15 wayland-info 2>/dev/null)
+        if [[ -z "$wi" ]]; then
+            note "wayland-info 没有返回接口列表（合成器无响应或环境异常），跳过剪贴板协议检查"
+        elif grep -q ext_data_control_manager_v1 <<< "$wi"; then
             pass "剪贴板：合成器支持 ext-data-control"
         elif grep -q zwlr_data_control_manager_v1 <<< "$wi"; then
             pass "剪贴板：合成器支持 wlr-data-control"
@@ -503,6 +676,153 @@ doctor() {
     fi
 
     echo
+    echo "[合成器能力（采集走哪条路）]"
+    # 合成器可以不宣告能力位：portal 后端读 AvailableSourceTypes/AvailableCursorModes，
+    # 读到 0 就拒绝每一次 SelectSources。表现是选择框里只有「整个屏幕」，或者直接失败。
+    case "${XDG_CURRENT_DESKTOP:-}" in
+    *niri*)
+        if command -v pacman >/dev/null 2>&1 && pacman -Qo /usr/bin/niri 2>/dev/null | grep -q 'niri-portal-cast'; then
+            pass "niri 来自 niri-portal-cast（带能力宣告与限帧率补丁）"
+        elif command -v pacman >/dev/null 2>&1 && pacman -Qo /usr/bin/niri >/dev/null 2>&1; then
+            note "/usr/bin/niri 不是 niri-portal-cast：原版 niri 不宣告 AvailableSourceTypes，portal 会拒绝所有 SelectSources（选择框里只剩「整个屏幕」）"
+        else
+            skip "niri 二进制来自哪个包无法判断（没有 pacman），跳过能力宣告检查"
+        fi
+        ;;
+    "")
+        if sess; then
+            skip "合成器不是 niri（XDG_CURRENT_DESKTOP 未设置），跳过 niri 专属的能力宣告检查"
+        else
+            no_sess "合成器能力宣告"
+        fi
+        ;;
+    *)
+        skip "合成器不是 niri（${XDG_CURRENT_DESKTOP}），跳过 niri 专属的能力宣告检查"
+        ;;
+    esac
+    # 直接问合成器它宣告了哪些全局接口：查 /usr/share/wayland-protocols 只能证明
+    # 协议定义装了，和这个合成器实不实现是两件事。
+    wl_globals=""
+    if sess && command -v wayland-info >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        wl_globals=$(timeout 15 wayland-info 2>/dev/null | grep -oE "^interface: '[^']+'" | sed "s/interface: '//; s/'//")
+    fi
+    if [[ -z "$wl_globals" ]]; then
+        if sess; then
+            note "拿不到合成器全局接口列表（没装 wayland-utils，或合成器没响应），跳过协议探测"
+        else
+            no_sess "合成器协议探测（wayland-info）"
+        fi
+    else
+        pass "合成器宣告了 $(printf '%s\n' "$wl_globals" | wc -l) 个全局接口"
+        # 有没有导出类协议只是「前提」，不能据此断言采集走不走零拷贝：本机就同时
+        # 宣告了 zwp_linux_dmabuf_v1 与 ext_image_copy_capture_manager_v1。真正作数
+        # 的是 portal/PipeWire 的格式协商，niri 会把它写进 journal。
+        if printf '%s\n' "$wl_globals" | grep -qE '^(zwlr_export_dmabuf_manager_v1|zwlr_screencopy_manager_v1|ext_image_copy_capture_manager_v1)$'; then
+            pass "合成器有导出/图像拷贝类采集协议（具备零拷贝采集的前提）"
+        else
+            note "合成器没有导出/图像拷贝类采集协议，零拷贝采集的前提不成立"
+        fi
+        if [[ "${XDG_CURRENT_DESKTOP:-}" == *niri* ]] && command -v journalctl >/dev/null 2>&1 &&
+            journalctl --user -u niri.service --since '-30min' --no-pager 2>/dev/null | grep -q 'negotiated inefficient shm stream'; then
+            note "实测协商走 SHM 拷贝（journal：negotiated inefficient shm stream）：共享占用记在系统内存（Shmem）里"
+        fi
+    fi
+
+    echo
+    echo "[采集流与内存（共享时才有意义）]"
+    # 「配置里写了」和「真的在推流」是两件事：只读配置会把没生效的值报成正常。
+    local live_line live_epoch live_rate start_at vstreams=0
+    live_line=$(last_negotiated_fps)
+    live_epoch=${live_line%% *}
+    live_rate=${live_line##* }
+    # 只有一个字段说明解析异常，宁可不用
+    [[ "$live_line" == "$live_epoch" ]] && live_rate=""
+    start_at=$(compositor_start_epoch)
+    if [[ -n "${live_rate:-}" && -n "${start_at:-}" ]] && (( ${live_epoch:-0} < start_at )); then
+        note "journal 里最近一次协商 ${live_rate} Hz 早于本次合成器启动，不作为现行值"
+        live_rate=""
+    fi
+    if ! sess; then
+        no_sess "采集流（PipeWire / niri journal）"
+    elif command -v wpctl >/dev/null 2>&1; then
+        vstreams=$(wpctl status 2>/dev/null | grep -c 'Stream/Output/Video')
+        if ((vstreams > 0)); then
+            pass "当前有 $vstreams 路视频采集流"
+        else
+            note "当前没有视频采集流（共享时再跑一次 --doctor）"
+        fi
+    fi
+    if [[ -n "${live_rate:-}" ]]; then
+        pass "最近一次实际协商到的帧率 ${live_rate} Hz"
+    fi
+    # 采集请求 / 成功出流：只数真正到达 Streaming 的会话（成功的 shm 协商不打印
+    # "negotiated"，拿它当判据会把正常会话算成失败）。
+    if [[ "${XDG_CURRENT_DESKTOP:-}" == *niri* ]] && command -v journalctl >/dev/null 2>&1; then
+        local jl rm_count stream_count
+        jl=$(journalctl --user -u niri.service --since '-30min' --no-pager 2>/dev/null)
+        rm_count=$(printf '%s\n' "$jl" | grep -c 'record_monitor')
+        stream_count=$(printf '%s\n' "$jl" | grep -c 'Paused -> Streaming')
+        if ((rm_count == 0)); then
+            note "最近 30 分钟没有任何采集请求（niri 没被叫到：问题在门口的选择框或客户端本身）"
+        elif ((stream_count == 0)); then
+            note "有 $rm_count 次采集请求，0 次出流：客户端要了屏幕，在协商格式之前就放弃了（常见原因是选择框被关掉，或音频设备切换把 PipeWire 图拆了）"
+        else
+            pass "$rm_count 次请求，$stream_count 次成功出流"
+        fi
+    fi
+    if [[ -r /proc/meminfo ]]; then
+        local s1 s2 rate shmem_gib
+        s1=$(shmem_kib)
+        shmem_gib=$(awk '/^Shmem:/{printf "%.2f", $2/1048576}' /proc/meminfo)
+        if ((vstreams > 0)); then
+            printf '       正在采样 2 秒算增长速率…\n'
+            sleep 2
+            s2=$(shmem_kib)
+            rate=$(((s2 - s1) / 2048))    # KiB / 2 秒 → MiB/s
+            ((rate < 0)) && rate=0
+            # 归属（谁占的内存）要读几百个 /proc 条目、单次多花约 8 秒，留到后续 PR
+            if ((rate > 100)); then
+                bad "共享内存正以 ${rate} MB/s 增长（Shmem ${shmem_gib} GiB），几十秒就会吃光内存"
+                printf '       先降档：niri 用户可在配置的 screencasting 块里限帧率/分辨率，改完重开一次共享\n'
+            elif ((rate >= 20)); then
+                note "共享内存以 ${rate} MB/s 增长（Shmem ${shmem_gib} GiB）"
+                printf '       降帧率/分辨率；注意 i915 的 GEM 是 shmem 记账的，但不进任何进程的\n'
+                printf '       smaps，所以「进程 Pss_Shmem 很小、Shmem 却在涨」是正常的。\n'
+            else
+                pass "共享内存稳定（2 秒内约 ${rate} MB/s，Shmem ${shmem_gib} GiB）"
+            fi
+        else
+            pass "Shmem ${shmem_gib} GiB（当前没有采集流，增长速率与归属要共享时才能测）"
+        fi
+    fi
+
+    echo
+    echo "[shmem 大页策略]"
+    # 命令行里写了不等于内核认：有些内核对 transparent_hugepage=shmem:xxx 直接
+    # "cannot parse, ignored"，只在 dmesg 里说一句，sysfs 仍是默认值。所以比对实际策略。
+    if [[ -r /sys/kernel/mm/transparent_hugepage/shmem_enabled ]]; then
+        local shmem_hp shmem_thp cmd_thp want_thp
+        shmem_hp=$(awk '/^ShmemHugePages:/{printf "%.2f", $2/1048576}' /proc/meminfo 2>/dev/null)
+        shmem_thp=$(sed 's/.*\[\([a-z_]*\)\].*/\1/' /sys/kernel/mm/transparent_hugepage/shmem_enabled)
+        cmd_thp=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null | grep -m1 '^transparent_hugepage=.*shmem' || true)
+        if [[ -n "${cmd_thp:-}" ]]; then
+            want_thp=${cmd_thp##*:}
+            if [[ "$want_thp" == "$shmem_thp" ]]; then
+                pass "shmem 大页策略 $shmem_thp（与内核命令行 $cmd_thp 一致）"
+            else
+                note "内核命令行写着 $cmd_thp，实际策略是 $shmem_thp —— 这个参数被内核丢掉了"
+                printf '       被丢掉的参数不会报错，只在 dmesg 里留一行 "transparent_hugepage= cannot parse, ignored"（读 dmesg 需要权限）。\n'
+                printf '       要真的改掉，开机后写 sysfs，例如放 /etc/tmpfiles.d/thp-shmem.conf：\n'
+                printf '       w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - never\n'
+            fi
+        else
+            note "shmem 大页策略 $shmem_thp（内核命令行没设置，用默认值；大页 ${shmem_hp:-?} GiB）"
+        fi
+    else
+        skip "没有 shmem_enabled，跳过大页策略检查"
+    fi
+
+    echo
     echo "[正在运行的 QQ]"
     local pid
     pid=$(qq_main_pid)
@@ -512,6 +832,56 @@ doctor() {
         pass "QQ（PID $pid）已注入"
     else
         bad "QQ（PID $pid）没有注入：请完全退出 QQ（含托盘），再从「QQ（Wayland修复版）」打开"
+    fi
+    # 逐进程审计：真正收帧的是 --type=ppapi 那个进程，它没被注入就等于没修。
+    # 判据是「四个库缺哪个」，不是数够四个：进程里可能还注入了别的 libqq-*.so
+    # （例如实验用的 libqq-nvenc.so），数个数会把缺库误判成齐全。
+    # 其它子进程按需注入，缺库不一定致命，所以只列前两条异常的，其余合计。
+    if [[ -n "$pid" ]]; then
+        local qqpids ppapi="" p missing others=0 others_ok=0 shown=0 more=0
+        local inject_libs="libqq-wl-portal.so libqq-clipbridge.so libqq-screenshot.so libqq-borderfix.so"
+        qqpids=$(pgrep -x qq 2>/dev/null)
+        for p in $qqpids; do
+            case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *--type=ppapi*) ppapi="$p" ;;
+            esac
+        done
+        missing_libs() {  # $1=pid → 打印缺的库（空 = 齐全）
+            local m="" l g
+            g=$(grep -ohE 'libqq-[a-z-]+\.so' "/proc/$1/maps" 2>/dev/null | sort -u)
+            for l in $inject_libs; do
+                printf '%s\n' "$g" | grep -qx "$l" || m="$m $l"
+            done
+            printf '%s' "$m"
+        }
+        if [[ -n "$ppapi" ]]; then
+            missing=$(missing_libs "$ppapi")
+            if [[ -z "$missing" ]]; then
+                pass "收帧进程 ppapi（PID $ppapi）四个库齐全"
+            elif ! grep -qs 'libqq-' "/proc/$ppapi/maps" 2>/dev/null; then
+                bad "收帧进程 ppapi（PID $ppapi）没有任何注入库：共享会退回 QQ 自己的老实现"
+            else
+                note "收帧进程 ppapi（PID $ppapi）缺库：$missing"
+            fi
+        else
+            note "没找到 --type=ppapi 进程（还没开始过共享？）"
+        fi
+        for p in $qqpids; do
+            [[ "$p" == "$ppapi" || "$p" == "$pid" ]] && continue
+            grep -qs 'libqq-' "/proc/$p/maps" 2>/dev/null || continue
+            others=$((others + 1))
+            missing=$(missing_libs "$p")
+            if [[ -z "$missing" ]]; then
+                others_ok=$((others_ok + 1))
+            elif ((shown < 2)); then
+                note "QQ 子进程（PID $p）缺库：$missing"
+                shown=$((shown + 1))
+            else
+                more=$((more + 1))
+            fi
+        done
+        ((others > 0)) && pass "另外 $others 个 QQ 子进程注入了库（$others_ok 个四个库齐全）"
+        ((more > 0)) && note "另有 $more 个子进程也缺库（未逐条列出）"
     fi
 
     echo
@@ -528,14 +898,27 @@ doctor() {
     fi
 
     echo
-    echo "通过 $ok，提醒 $warn，失败 $fail。日志：$LOG"
+    if (( skipped > 0 )); then
+        echo "通过 $ok，提醒 $warn，失败 $fail，跳过 $skipped。日志：$LOG"
+    else
+        echo "通过 $ok，提醒 $warn，失败 $fail。日志：$LOG"
+    fi
     [[ $fail -eq 0 ]]
 }
 
 case "${1:-}" in
     --doctor) doctor; exit $? ;;
-    --version) echo "linuxqq-wayland-fix $VERSION"; exit 0 ;;
+    --version)
+        if [[ -n "$TEMPLATE_UNBUILT" ]]; then echo "linuxqq-wayland-fix （未构建模板）"; else echo "linuxqq-wayland-fix $VERSION"; fi
+        exit 0 ;;
     --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # 其余 -- 参数是刻意透传给 QQ 的（--use-gl/--use-angle/--force-device-scale-factor 等）。
+    # 但把自检敲成 --docter 这类拼写错误时会静默启动 QQ，很容易误判成"自检没输出"，
+    # 所以这里明确提示一次，行为不变。裸 "--"（约定：选项结束、后面都当参数）不提示。
+    --?*)
+        echo "linuxqq-wayland-fix: 不认识的参数 $1 —— 将原样传给 QQ（自检请用 --doctor）" >&2
+        echo "      用法: linuxqq-wayland-fix [--doctor|--version|--help] [传给 QQ 的参数…]" >&2 ;;
+
 esac
 
 QQ=$(find_qq)
