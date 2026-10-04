@@ -317,6 +317,81 @@ audio_graph_outputs() {
     printf '%s %s %s\n' "$wired" "$bt" "$prof"
 }
 
+# ---- 采集与内存：合成器能力、帧率是否真的生效、谁在占共享内存 ---------------
+# /proc/meminfo 的 Shmem（普通共享内存 + GPU 侧 system 记账的总和），单位 KiB
+shmem_kib() { awk '/^Shmem:/{print $2+0; exit}' /proc/meminfo 2>/dev/null; }
+
+# 一个进程的共享内存占用（KiB）。注意 smaps_rollup 里没有裸的 Shmem: 字段。
+pss_shmem() {  # $1=pid
+    local v
+    v=$(awk '/^Pss_Shmem:/{print $2+0; exit}' "/proc/$1/smaps_rollup" 2>/dev/null)
+    printf '%s' "${v:-0}"
+}
+
+# 一个进程的 DRM "system" 对象总量（KiB）。同一个 DRM client 会通过多个复制出来的 fd
+# 重复出现（drm-client-id 相同），必须按 client 去重，否则同一块内存会被算好几遍。
+drm_sys_kib() {  # $1=pid
+    local f
+    for f in /proc/"$1"/fdinfo/*; do
+        [[ -r "$f" ]] || continue
+        awk '/^drm-client-id:/{id=$2}
+             /^drm-total-system/{if (id != "") print id, $2+0}' "$f" 2>/dev/null
+    done | awk '{ if ($2 > m[$1]) m[$1] = $2 } END { s=0; for (i in m) s += m[i]; printf "%d", s+0 }'
+}
+
+# 找出「进程内共享内存 + GPU 侧」最多的进程。要读几百个 /proc 条目，只在真有采集流时调用。
+scan_top() {
+    top_res=0; top_pid=""; top_name="?"; top_pss=0; top_gem=0
+    local d p pss gem f res
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [[ -r "$d/smaps_rollup" ]] || continue
+        pss=$(pss_shmem "$p")
+        gem=0
+        # 只有真的打开过 /dev/dri 的进程才可能持有 GPU 对象，先便宜地筛一遍
+        for f in "$d"/fd/*; do
+            case "$(readlink "$f" 2>/dev/null)" in
+            /dev/dri/*) gem=$(drm_sys_kib "$p"); break ;;
+            esac
+        done
+        res=$((pss + gem))
+        if ((res > top_res)); then
+            top_res=$res; top_pid=$p; top_pss=$pss; top_gem=$gem
+            top_name=$(cat "$d/comm" 2>/dev/null)
+            [[ -n "$top_name" ]] || top_name="?"
+        fi
+    done
+}
+
+# journal 里最近一次真实协商到的帧率，返回「epoch 帧率」。帧率要匹配第一个
+# `framerate:` 片段：整行里还有 pixel_aspect_ratio 等别的 num:，贪心匹配会取错。
+last_negotiated_fps() {
+    command -v journalctl >/dev/null 2>&1 || return 0
+    local line ep rate
+    line=$(journalctl --user -u niri.service --since '-30min' --no-pager -o short-unix 2>/dev/null |
+        grep 'framerate: spa_fraction { num:' | tail -1)
+    [[ -n "${line:-}" ]] || return 0
+    ep=${line%% *}
+    rate=$(printf '%s' "$line" | grep -oE 'framerate: spa_fraction \{ num: [0-9]+' |
+        head -1 | grep -oE '[0-9]+$')
+    printf '%s %s\n' "${ep%%.*}" "${rate:-0}"
+}
+
+# 合成器启动时刻（epoch），用来判断 journal 里的协商记录是不是本次启动之后的。
+compositor_start_epoch() {
+    local ts p
+    if command -v systemctl >/dev/null 2>&1; then
+        # LC_ALL=C: systemd 按 locale 格式化时间戳，中文 locale 下 date -d 解析不了
+        ts=$(LC_ALL=C systemctl --user show niri.service -p ActiveEnterTimestamp --value 2>/dev/null)
+        if [[ -n "${ts:-}" && "$ts" != "n/a" ]]; then
+            LC_ALL=C date -d "$ts" +%s 2>/dev/null && return 0
+        fi
+    fi
+    p=$(pgrep -x niri 2>/dev/null | head -1)
+    [[ -n "${p:-}" ]] && stat -c %Y "/proc/$p" 2>/dev/null
+    return 0
+}
+
 doctor() {
     local ok=0 warn=0 fail=0 skipped=0
     pass() { printf '  \e[32m✓\e[0m %s\n' "$*"; ok=$((ok + 1)); }
@@ -386,7 +461,7 @@ doctor() {
     echo
     echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
     local ag
-    if ag=$(audio_graph_outputs); then
+    if command -v wpctl >/dev/null 2>&1 && ag=$(audio_graph_outputs); then
         local wired bt prof rest
         wired="${ag%% *}"
         rest="${ag#* }"
@@ -593,6 +668,137 @@ doctor() {
     fi
 
     echo
+    echo "[合成器能力（采集走哪条路）]"
+    # 合成器可以不宣告能力位：portal 后端读 AvailableSourceTypes/AvailableCursorModes，
+    # 读到 0 就拒绝每一次 SelectSources。表现是选择框里只有「整个屏幕」，或者直接失败。
+    case "${XDG_CURRENT_DESKTOP:-}" in
+    *niri*)
+        if command -v pacman >/dev/null 2>&1 && pacman -Qo /usr/bin/niri 2>/dev/null | grep -q 'niri-portal-cast'; then
+            pass "niri 来自 niri-portal-cast（带能力宣告与限帧率补丁）"
+        elif command -v pacman >/dev/null 2>&1 && pacman -Qo /usr/bin/niri >/dev/null 2>&1; then
+            note "/usr/bin/niri 不是 niri-portal-cast：原版 niri 不宣告 AvailableSourceTypes，portal 会拒绝所有 SelectSources（选择框里只剩「整个屏幕」）"
+        else
+            skip "niri 二进制来自哪个包无法判断（没有 pacman），跳过能力宣告检查"
+        fi
+        ;;
+    *)
+        skip "合成器不是 niri（${XDG_CURRENT_DESKTOP:-未知}），跳过 niri 专属的能力宣告检查"
+        ;;
+    esac
+    # 直接问合成器它宣告了哪些全局接口：查 /usr/share/wayland-protocols 只能证明
+    # 协议定义装了，和这个合成器实不实现是两件事。
+    wl_globals=""
+    if command -v wayland-info >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+        wl_globals=$(timeout 15 wayland-info 2>/dev/null | grep -oE "^interface: '[^']+'" | sed "s/interface: '//; s/'//")
+    fi
+    if [[ -z "$wl_globals" ]]; then
+        note "拿不到合成器全局接口列表（没装 wayland-utils，或合成器没响应），跳过协议探测"
+    else
+        pass "合成器宣告了 $(printf '%s\n' "$wl_globals" | wc -l) 个全局接口"
+        if printf '%s\n' "$wl_globals" | grep -qE '^zwlr_export_dmabuf_manager_v1$'; then
+            pass "宣告 DMA-BUF 导出（可零拷贝采集）"
+        else
+            note "不宣告 DMA-BUF 导出：采集只能走 SHM 拷贝，共享占用记在系统内存（Shmem）里"
+        fi
+    fi
+
+    echo
+    echo "[采集流与内存（共享时才有意义）]"
+    # 「配置里写了」和「真的在推流」是两件事：只读配置会把没生效的值报成正常。
+    local live_line live_epoch live_rate start_at vstreams=0
+    live_line=$(last_negotiated_fps)
+    live_epoch=${live_line%% *}
+    live_rate=${live_line##* }
+    # 只有一个字段说明解析异常，宁可不用
+    [[ "$live_line" == "$live_epoch" ]] && live_rate=""
+    start_at=$(compositor_start_epoch)
+    if [[ -n "${live_rate:-}" && -n "${start_at:-}" ]] && (( ${live_epoch:-0} < start_at )); then
+        note "journal 里最近一次协商 ${live_rate} Hz 早于本次合成器启动，不作为现行值"
+        live_rate=""
+    fi
+    if command -v wpctl >/dev/null 2>&1; then
+        vstreams=$(wpctl status 2>/dev/null | grep -c 'Stream/Output/Video')
+        if ((vstreams > 0)); then
+            pass "当前有 $vstreams 路视频采集流"
+        else
+            note "当前没有视频采集流（共享时再跑一次 --doctor）"
+        fi
+    fi
+    if [[ -n "${live_rate:-}" ]]; then
+        pass "最近一次实际协商到的帧率 ${live_rate} Hz"
+    fi
+    # 采集请求 / 成功出流：只数真正到达 Streaming 的会话（成功的 shm 协商不打印
+    # "negotiated"，拿它当判据会把正常会话算成失败）。
+    if [[ "${XDG_CURRENT_DESKTOP:-}" == *niri* ]] && command -v journalctl >/dev/null 2>&1; then
+        local jl rm_count stream_count
+        jl=$(journalctl --user -u niri.service --since '-30min' --no-pager 2>/dev/null)
+        rm_count=$(printf '%s\n' "$jl" | grep -c 'record_monitor')
+        stream_count=$(printf '%s\n' "$jl" | grep -c 'Paused -> Streaming')
+        if ((rm_count == 0)); then
+            note "最近 30 分钟没有任何采集请求（niri 没被叫到：问题在门口的选择框或客户端本身）"
+        elif ((stream_count == 0)); then
+            note "有 $rm_count 次采集请求，0 次出流：客户端要了屏幕，在协商格式之前就放弃了（常见原因是选择框被关掉，或音频设备切换把 PipeWire 图拆了）"
+        else
+            pass "$rm_count 次请求，$stream_count 次成功出流"
+        fi
+    fi
+    if [[ -r /proc/meminfo ]]; then
+        local s1 s2 rate shmem_gib
+        s1=$(shmem_kib)
+        shmem_gib=$(awk '/^Shmem:/{printf "%.2f", $2/1048576}' /proc/meminfo)
+        if ((vstreams > 0)); then
+            printf '       正在采样 2 秒并扫描进程占用（有采集流时这一步要几秒）…\n'
+            sleep 2
+            s2=$(shmem_kib)
+            rate=$(((s2 - s1) / 2048))    # KiB / 2 秒 → MiB/s
+            ((rate < 0)) && rate=0
+            # 找到占用最多的进程要读几百个 /proc 条目，只在真有流时做
+            scan_top
+            if [[ -n "$top_pid" ]]; then
+                note "占用最多：$top_name (PID $top_pid)  进程内共享 $((top_pss / 1024)) MiB + GPU 侧 $((top_gem / 1024)) MiB"
+            fi
+            if ((rate > 100)); then
+                bad "共享内存正以 ${rate} MB/s 增长（Shmem ${shmem_gib} GiB），几十秒就会吃光内存"
+                printf '       先降档：niri 用户可在配置的 screencasting 块里限帧率/分辨率，改完重开一次共享\n'
+            elif ((rate >= 20)); then
+                note "共享内存以 ${rate} MB/s 增长（Shmem ${shmem_gib} GiB）"
+                printf '       降帧率/分辨率；注意 i915 的 GEM 是 shmem 记账的，但不进任何进程的\n'
+                printf '       smaps，所以「进程 Pss_Shmem 很小、Shmem 却在涨」是正常的。\n'
+            else
+                pass "共享内存稳定（2 秒内约 ${rate} MB/s，Shmem ${shmem_gib} GiB）"
+            fi
+        else
+            pass "Shmem ${shmem_gib} GiB（当前没有采集流，增长速率与归属要共享时才能测）"
+        fi
+    fi
+
+    echo
+    echo "[shmem 大页策略]"
+    # 命令行里写了不等于内核认：有些内核对 transparent_hugepage=shmem:xxx 直接
+    # "cannot parse, ignored"，只在 dmesg 里说一句，sysfs 仍是默认值。所以比对实际策略。
+    if [[ -r /sys/kernel/mm/transparent_hugepage/shmem_enabled ]]; then
+        local shmem_hp shmem_thp cmd_thp want_thp
+        shmem_hp=$(awk '/^ShmemHugePages:/{printf "%.2f", $2/1048576}' /proc/meminfo 2>/dev/null)
+        shmem_thp=$(sed 's/.*\[\([a-z_]*\)\].*/\1/' /sys/kernel/mm/transparent_hugepage/shmem_enabled)
+        cmd_thp=$(tr ' ' '\n' < /proc/cmdline 2>/dev/null | grep -m1 '^transparent_hugepage=.*shmem' || true)
+        if [[ -n "${cmd_thp:-}" ]]; then
+            want_thp=${cmd_thp##*:}
+            if [[ "$want_thp" == "$shmem_thp" ]]; then
+                pass "shmem 大页策略 $shmem_thp（与内核命令行 $cmd_thp 一致）"
+            else
+                note "内核命令行写着 $cmd_thp，实际策略是 $shmem_thp —— 这个参数被内核丢掉了"
+                printf '       被丢掉的参数不会报错，只在 dmesg 里有一行 "transparent_hugepage= cannot parse, ignored"。\n'
+                printf '       要真的改掉，开机后写 sysfs，例如放 /etc/tmpfiles.d/thp-shmem.conf：\n'
+                printf '       w /sys/kernel/mm/transparent_hugepage/shmem_enabled - - - - never\n'
+            fi
+        else
+            note "shmem 大页策略 $shmem_thp（内核命令行没设置，用默认值；大页 ${shmem_hp:-?} GiB）"
+        fi
+    else
+        skip "没有 shmem_enabled，跳过大页策略检查"
+    fi
+
+    echo
     echo "[正在运行的 QQ]"
     local pid
     pid=$(qq_main_pid)
@@ -602,6 +808,55 @@ doctor() {
         pass "QQ（PID $pid）已注入"
     else
         bad "QQ（PID $pid）没有注入：请完全退出 QQ（含托盘），再从「QQ（Wayland修复版）」打开"
+    fi
+    # 逐进程审计：真正收帧的是 --type=ppapi 那个进程，它没被注入就等于没修。
+    # QQ 自己也带 libqq-*.so，所以判据是「四个库缺哪个」，不是数够四个。
+    # 其它子进程按需注入，缺库不一定致命，所以只列前两条异常的，其余合计。
+    if [[ -n "$pid" ]]; then
+        local qqpids ppapi="" p missing others=0 others_ok=0 shown=0 more=0
+        local inject_libs="libqq-wl-portal.so libqq-clipbridge.so libqq-screenshot.so libqq-borderfix.so"
+        qqpids=$(pgrep -x qq 2>/dev/null)
+        for p in $qqpids; do
+            case "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null)" in
+            *--type=ppapi*) ppapi="$p" ;;
+            esac
+        done
+        missing_libs() {  # $1=pid → 打印缺的库（空 = 齐全）
+            local m="" l g
+            g=$(grep -ohE 'libqq-[a-z-]+\.so' "/proc/$1/maps" 2>/dev/null | sort -u)
+            for l in $inject_libs; do
+                printf '%s\n' "$g" | grep -qx "$l" || m="$m $l"
+            done
+            printf '%s' "$m"
+        }
+        if [[ -n "$ppapi" ]]; then
+            missing=$(missing_libs "$ppapi")
+            if [[ -z "$missing" ]]; then
+                pass "收帧进程 ppapi（PID $ppapi）四个库齐全"
+            elif ! grep -qs 'libqq-' "/proc/$ppapi/maps" 2>/dev/null; then
+                bad "收帧进程 ppapi（PID $ppapi）没有任何注入库：共享会退回 QQ 自己的老实现"
+            else
+                note "收帧进程 ppapi（PID $ppapi）缺库：$missing"
+            fi
+        else
+            note "没找到 --type=ppapi 进程（还没开始过共享？）"
+        fi
+        for p in $qqpids; do
+            [[ "$p" == "$ppapi" || "$p" == "$pid" ]] && continue
+            grep -qs 'libqq-' "/proc/$p/maps" 2>/dev/null || continue
+            others=$((others + 1))
+            missing=$(missing_libs "$p")
+            if [[ -z "$missing" ]]; then
+                others_ok=$((others_ok + 1))
+            elif ((shown < 2)); then
+                note "QQ 子进程（PID $p）缺库：$missing"
+                shown=$((shown + 1))
+            else
+                more=$((more + 1))
+            fi
+        done
+        ((others > 0)) && pass "另外 $others 个 QQ 子进程注入了库（$others_ok 个四个库齐全）"
+        ((more > 0)) && note "另有 $more 个子进程也缺库（未逐条列出）"
     fi
 
     echo
