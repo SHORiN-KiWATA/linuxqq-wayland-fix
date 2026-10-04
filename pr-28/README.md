@@ -1,22 +1,22 @@
 # 测试包：PR #28（屏幕共享可选 NVENC 硬件编码）
 
-给 [PR #28](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/pull/28) 的测试包，基于 **v0.2.17 + PR #28**（commit `292da96`），版本号 `0.2.17.test.nvenc.1`。
+给 [PR #28](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/pull/28) 的测试包，基于 **v0.2.17 + PR #28**（commit `9b816b0`），版本号 `0.2.17.test.nvenc.2`。
 
 ## 包
 
-| 发行版 | 文件 |
-|---|---|
-| Arch Linux | `linuxqq-wayland-fix-0.2.17.test.nvenc.1-1-x86_64.pkg.tar.zst` |
-| Debian / Ubuntu | `linuxqq-wayland-fix_0.2.17.test.nvenc.1-1~test_amd64.deb` |
+| 发行版 | 文件 | sha256 |
+|---|---|---|
+| Arch Linux | `linuxqq-wayland-fix-0.2.17.test.nvenc.2-1-x86_64.pkg.tar.zst` | `abd5a1ca7ed376e71319e58701016e462dbea1fb87a1e3851b8eab288255dba2` |
+| Debian / Ubuntu | `linuxqq-wayland-fix_0.2.17.test.nvenc.2-1~test_amd64.deb` | `54ff64739440b560eaf98b70d0f7e5bd42d9ce9fa082c1f43d2c6d5859bb78d0` |
 
 安装：
 
 ```bash
 # Arch
-sudo pacman -U linuxqq-wayland-fix-0.2.17.test.nvenc.1-1-x86_64.pkg.tar.zst
+sudo pacman -U linuxqq-wayland-fix-0.2.17.test.nvenc.2-1-x86_64.pkg.tar.zst
 
 # Debian / Ubuntu
-sudo apt install ./linuxqq-wayland-fix_0.2.17.test.nvenc.1-1~test_amd64.deb
+sudo apt install ./linuxqq-wayland-fix_0.2.17.test.nvenc.2-1~test_amd64.deb
 ```
 
 ## 这个包是什么
@@ -26,31 +26,41 @@ QQ 的 AVSDK 只有软件 H.264 编码器；这个包额外带一个**可选**�
 启动方式（**一个开关**）：
 
 ```bash
-# 启用 NVENC 编码
 QQ_NVENC=1 linuxqq-wayland-fix
-
-# 只挂钩旁观、不接管（排查用）
-QQ_NVENC=1 QQ_NVENC_PROBE=1 linuxqq-wayland-fix
 ```
 
-## 本版包含的修复（相对旧测试包）
+## 本版相对 0.2.17.test.nvenc.1 的变化（重要）
 
-- **帧号修复**：`VideoPacket` 的 `+0x00/+0x08` 改用输入帧自带的 64 位帧号（与 `CO264RTEncoder::Encode` 反汇编一致，两处各写 8 字节）。此前用自建计数器，跨编码器对象/会话对不上，下游按帧号做队列匹配失败会让对端收不到画面；实机验证：修复后对端出画面。
-- `+0x20` 帧类型补 I 帧映射（1/2/3）；并发创建编码器的槽位竞态修复。
-- 开关合并：`QQ_NVENC=1` 即启用（删除 `QQ_NVENC_ACTIVE`）。
+上一版把帧号来源改成「输入帧 +0x10 的 64 位值」后，实机反馈**对端看不到画面**（[FJKiXfaR](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/commit/15739529055e90bf5ae4b87f5b8ec6bb8e0208ec#commitcomment-203369129)、ljm-233），而旧版计数器方案正常。本版：
+
+- **帧号/帧类型回退到实机验证过的计数器方案**（4 字节写入，与 0.2.15.test2 相同）；
+- 保留：编码器槽位竞态修复、单开关（`QQ_NVENC=1`）；
+- 新增调试开关 `QQ_NVENC_SEQ=frame`：切回帧号来源，可在同一构建上做 A/B 对比；
+- 出帧日志同时打印计数器与 `frame+0x10` 的运行时取值（前 4 帧）。
 
 ## 怎么验证
 
 1. `linuxqq-wayland-fix --doctor` 应显示 `NVENC：CreateH264Encoder 符号存在，入口字节与挂钩点一致`；
-2. `QQ_NVENC=1` 启动、开屏幕共享，日志里挂钩成功、无回落：
+2. 默认启动、开屏幕共享，**对端应能看到画面**（与 0.2.15.test2 一致）：
 
    ```bash
+   QQ_NVENC=1 linuxqq-wayland-fix
    grep NVENC $XDG_RUNTIME_DIR/linuxqq-wayland-fix.log
    ```
 
-3. 对端（手机 / 另一账号）能看到画面、流畅；出帧日志里 `帧号=` 连续递增；
-4. 编码失败会自动回落软件编码（`nv_dead`），不丢帧、不崩溃。
+3. A/B 排查（可能出现对端无画面，用于对比数据）：
+
+   ```bash
+   # 帧号来源：输入帧 +0x10（8 字节写入）
+   QQ_NVENC=1 QQ_NVENC_SEQ=frame linuxqq-wayland-fix
+   ```
+
+4. 旁观原实现写进 packet 的值（不影响正式路径）：
+
+   ```bash
+   QQ_NVENC=1 QQ_NVENC_PROBE=1 QQ_NVENC_PROBE_DUMP=1 linuxqq-wayland-fix
+   ```
 
 反馈请发到 [PR #28](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/pull/28)。
 
-> **混合显卡用户注意**：启用 NVENC 需要加载 nvidia 模块，独显的 Vulkan 设备会随之出现；启动器会自动把 QQ 的 Vulkan 限定到显示 GPU，规避「观看共享花屏」（见 [PR #38](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/pull/38) 与 `docs/原理详解.md#附观看共享花屏`）。
+> **混合显卡提示**：本包基于 v0.2.17，不含 [PR #38](https://github.com/SHORiN-KiWATA/linuxqq-wayland-fix/pull/38) 的「把 QQ 的 Vulkan 限定到显示 GPU」；开启独显后观看共享若出现花屏，属于 #38 的范畴。
