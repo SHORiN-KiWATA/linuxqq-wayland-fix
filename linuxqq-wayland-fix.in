@@ -23,10 +23,15 @@ set -u
 
 VERSION="@VERSION@"
 LIBDIR="@LIBEXECDIR@"
-# 直接从源码树跑（还没 make、也没装包）时，上面两个占位符仍是 "@…@"：库路径类检查没法进行，
-# 这时明确降级为「跳过」，而不是报一串「找不到 @LIBEXECDIR@/…」的假失败。
+# 直接从源码树跑（还没 make、也没装包）时，上面两个占位符还没被替换成真值：库路径类检查
+# 没法进行，这时明确降级为「跳过」，而不是报一串「找不到 …/libqq-wl-portal.so」的假失败。
+# 判据写成 "@*@"：不能写出占位符的字面量 —— Makefile 的替换会把文件里每一处字面量都换掉，
+# 那样连上面的 case 模式本身都会被替换成实际值，装好的脚本反而永远判定为「未构建」。
+# 同时它也不会把安装路径里合法含 "@" 的情况（自建前缀等）误判成模板 —— 否则「库真的没装」
+# 会被一并跳过，而那正是自检要抓的东西。
 TEMPLATE_UNBUILT=""
-case "$VERSION$LIBDIR" in *@*) TEMPLATE_UNBUILT=1 ;; esac
+case "$VERSION" in @*@) TEMPLATE_UNBUILT=1 ;; esac
+case "$LIBDIR" in @*@) TEMPLATE_UNBUILT=1 ;; esac
 SCREENSHARE_LIB="$LIBDIR/libqq-wl-portal.so"
 CLIPBOARD_LIB="$LIBDIR/libqq-clipbridge.so"
 SCREENSHOT_LIB="$LIBDIR/libqq-screenshot.so"
@@ -321,7 +326,7 @@ doctor() {
 
     if [[ -n "$TEMPLATE_UNBUILT" ]]; then
         echo "linuxqq-wayland-fix （未构建模板）自检"
-        note "这是源码树里的模板（@VERSION@/@LIBEXECDIR@ 未替换）：依赖安装路径的检查标为跳过；完整自检请按 README 构建或装包后再跑"
+        note "这是源码树里的模板（版本/库路径占位符未替换）：依赖安装路径的检查标为跳过；完整自检请按 README 构建或装包后再跑"
     else
         echo "linuxqq-wayland-fix $VERSION 自检"
     fi
@@ -336,7 +341,7 @@ doctor() {
         note "未检测到已安装的 linuxqq / linuxqq-appimage 包（可能手动安装）"
     fi
     if [[ -n "$TEMPLATE_UNBUILT" ]]; then
-        skip "屏幕共享修复 / 剪贴板修复 / 截图防闪退 / 窗口修补: 跳过（未构建模板，@LIBEXECDIR@ 未替换）"
+        skip "屏幕共享修复 / 剪贴板修复 / 截图防闪退 / 窗口修补: 跳过（未构建模板，库路径未替换）"
     else
         [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
         if clipboard_auto_disabled; then
@@ -379,7 +384,6 @@ doctor() {
     esac
 
     echo
-    echo
     echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
     local ag
     if ag=$(audio_graph_outputs); then
@@ -398,6 +402,8 @@ doctor() {
             echo "      通话期间别用耳机麦（或让它只留 A2DP 档）；已经卡住时 systemctl --user restart pipewire wireplumber"
         elif [[ -n "$prof" ]]; then
             pass "音频图: 有线=$wired 蓝牙=$bt（蓝牙档位 $prof，听歌档；通话切到 HFP 时会重建图）"
+        elif [[ "$bt" -eq 0 && "$wired" -gt 1 ]]; then
+            pass "音频输出: 没有蓝牙输出在线（有线=$wired 个，都在线）"
         else
             pass "音频输出: 只有一种在线（有线=$wired 蓝牙=$bt）"
         fi
@@ -628,8 +634,8 @@ case "${1:-}" in
     --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     # 其余 -- 参数是刻意透传给 QQ 的（--use-gl/--use-angle/--force-device-scale-factor 等）。
     # 但把自检敲成 --docter 这类拼写错误时会静默启动 QQ，很容易误判成"自检没输出"，
-    # 所以这里明确提示一次，行为不变。
-    --*)
+    # 所以这里明确提示一次，行为不变。裸 "--"（约定：选项结束、后面都当参数）不提示。
+    --?*)
         echo "linuxqq-wayland-fix: 不认识的参数 $1 —— 将原样传给 QQ（自检请用 --doctor）" >&2
         echo "      用法: linuxqq-wayland-fix [--doctor|--version|--help] [传给 QQ 的参数…]" >&2 ;;
 
