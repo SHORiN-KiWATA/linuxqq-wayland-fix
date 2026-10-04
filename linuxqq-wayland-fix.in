@@ -321,48 +321,6 @@ audio_graph_outputs() {
 # /proc/meminfo 的 Shmem（普通共享内存 + GPU 侧 system 记账的总和），单位 KiB
 shmem_kib() { awk '/^Shmem:/{print $2+0; exit}' /proc/meminfo 2>/dev/null; }
 
-# 一个进程的共享内存占用（KiB）。注意 smaps_rollup 里没有裸的 Shmem: 字段。
-pss_shmem() {  # $1=pid
-    local v
-    v=$(awk '/^Pss_Shmem:/{print $2+0; exit}' "/proc/$1/smaps_rollup" 2>/dev/null)
-    printf '%s' "${v:-0}"
-}
-
-# 一个进程的 DRM "system" 对象总量（KiB）。同一个 DRM client 会通过多个复制出来的 fd
-# 重复出现（drm-client-id 相同），必须按 client 去重，否则同一块内存会被算好几遍。
-drm_sys_kib() {  # $1=pid
-    local f
-    for f in /proc/"$1"/fdinfo/*; do
-        [[ -r "$f" ]] || continue
-        awk '/^drm-client-id:/{id=$2}
-             /^drm-total-system/{if (id != "") print id, $2+0}' "$f" 2>/dev/null
-    done | awk '{ if ($2 > m[$1]) m[$1] = $2 } END { s=0; for (i in m) s += m[i]; printf "%d", s+0 }'
-}
-
-# 找出「进程内共享内存 + GPU 侧」最多的进程。要读几百个 /proc 条目，只在真有采集流时调用。
-scan_top() {
-    top_res=0; top_pid=""; top_name="?"; top_pss=0; top_gem=0
-    local d p pss gem f res
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
-        [[ -r "$d/smaps_rollup" ]] || continue
-        pss=$(pss_shmem "$p")
-        gem=0
-        # 只有真的打开过 /dev/dri 的进程才可能持有 GPU 对象，先便宜地筛一遍
-        for f in "$d"/fd/*; do
-            case "$(readlink "$f" 2>/dev/null)" in
-            /dev/dri/*) gem=$(drm_sys_kib "$p"); break ;;
-            esac
-        done
-        res=$((pss + gem))
-        if ((res > top_res)); then
-            top_res=$res; top_pid=$p; top_pss=$pss; top_gem=$gem
-            top_name=$(cat "$d/comm" 2>/dev/null)
-            [[ -n "$top_name" ]] || top_name="?"
-        fi
-    done
-}
-
 # journal 里最近一次真实协商到的帧率，返回「epoch 帧率」。帧率要匹配第一个
 # `framerate:` 片段：整行里还有 pixel_aspect_ratio 等别的 num:，贪心匹配会取错。
 last_negotiated_fps() {
@@ -747,16 +705,12 @@ doctor() {
         s1=$(shmem_kib)
         shmem_gib=$(awk '/^Shmem:/{printf "%.2f", $2/1048576}' /proc/meminfo)
         if ((vstreams > 0)); then
-            printf '       正在采样 2 秒并扫描进程占用（有采集流时这一步要几秒）…\n'
+            printf '       正在采样 2 秒算增长速率…\n'
             sleep 2
             s2=$(shmem_kib)
             rate=$(((s2 - s1) / 2048))    # KiB / 2 秒 → MiB/s
             ((rate < 0)) && rate=0
-            # 找到占用最多的进程要读几百个 /proc 条目，只在真有流时做
-            scan_top
-            if [[ -n "$top_pid" ]]; then
-                note "占用最多：$top_name (PID $top_pid)  进程内共享 $((top_pss / 1024)) MiB + GPU 侧 $((top_gem / 1024)) MiB"
-            fi
+            # 归属（谁占的内存）要读几百个 /proc 条目、单次多花约 8 秒，留到后续 PR
             if ((rate > 100)); then
                 bad "共享内存正以 ${rate} MB/s 增长（Shmem ${shmem_gib} GiB），几十秒就会吃光内存"
                 printf '       先降档：niri 用户可在配置的 screencasting 块里限帧率/分辨率，改完重开一次共享\n'
