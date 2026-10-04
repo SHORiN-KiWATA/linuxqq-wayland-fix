@@ -374,7 +374,9 @@ doctor() {
         rest="${ag#* }"
         bt="${rest%% *}"
         prof="${rest#* }"
-        if [[ "$wired" -gt 0 && "$bt" -gt 0 ]]; then
+        if [[ "$wired" -eq 0 && "$bt" -eq 0 ]]; then
+            note "没检测到在线的音频输出（声卡未就绪或都被禁用了）"
+        elif [[ "$wired" -gt 0 && "$bt" -gt 0 ]]; then
             note "有线和蓝牙音频输出同时在线（有线=$wired 蓝牙=$bt）：WirePlumber 会换默认设备、PipeWire 重建图，共享会突然无画面、通话可能挂不断"
             echo "      断开其中一个，或 wpctl set-default <输出 id> 钉住默认设备；已经卡住时 systemctl --user restart pipewire wireplumber"
         elif [[ "$prof" == *headset* || "$prof" == *hfp* ]]; then
