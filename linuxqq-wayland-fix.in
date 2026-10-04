@@ -270,15 +270,24 @@ screenshot_helper_desktop() {
 
 # 音频图：有线和蓝牙输出同时在线时，WirePlumber 会在两者之间切换默认设备，
 # PipeWire 随之重建整个图，采集/通话客户端手里的 node 句柄失效 —— 共享会突然没画面，
-# 通话也可能挂不断。蓝牙在通话中从 A2DP 切到 HFP（用麦）同样会重建图，那条没法从
-# wpctl 输出可靠判断，这里只报"两个输出同时在线"这一种能判定、且最常见的。
+# 通话也可能挂不断。
+#
+# 蓝牙单独在线时同样会断：通话（用麦）会把蓝牙从 A2DP 切到 HFP，PipeWire 一样重建图。
+# 当前档位可以读出来 —— wpctl inspect 的 api.bluez5.profile：a2dp-sink 是听歌档，
+# headset-head-unit / 带 hfp 的是通话档，后者正处在"一用麦就重建图"的路径上。
+# 输出：有线数 蓝牙数 蓝牙档位（读不到就是空串）
 audio_graph_outputs() {
     command -v wpctl >/dev/null 2>&1 || return 1
     local st
     st=$(wpctl status 2>/dev/null) || return 1
-    printf '%s %s\n' \
-        "$(printf '%s\n' "$st" | grep -c 'alsa_output')" \
-        "$(printf '%s\n' "$st" | grep -c 'bluez_output')"
+    local wired bt prof="" id
+    wired=$(printf '%s\n' "$st" | grep -c 'alsa_output')
+    bt=$(printf '%s\n' "$st" | grep -c 'bluez_output')
+    if [[ "$bt" -gt 0 ]]; then
+        id=$(printf '%s\n' "$st" | grep 'bluez_output' | grep -oE '[0-9]+\.' | head -1 | tr -d '.')
+        [[ -n "$id" ]] && prof=$(wpctl inspect "$id" 2>/dev/null | grep 'api.bluez5.profile' | head -1 | sed 's/.*= *//; s/"//g')
+    fi
+    printf '%s %s %s\n' "$wired" "$bt" "$prof"
 }
 
 doctor() {
@@ -342,10 +351,19 @@ doctor() {
     echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
     local ag
     if ag=$(audio_graph_outputs); then
-        local wired="${ag%% *}" bt="${ag##* }"
+        local wired bt prof rest
+        wired="${ag%% *}"
+        rest="${ag#* }"
+        bt="${rest%% *}"
+        prof="${rest#* }"
         if [[ "$wired" -gt 0 && "$bt" -gt 0 ]]; then
             note "有线和蓝牙音频输出同时在线（有线=$wired 蓝牙=$bt）：WirePlumber 会换默认设备、PipeWire 重建图，共享会突然无画面、通话可能挂不断"
             echo "      断开其中一个，或 wpctl set-default <输出 id> 钉住默认设备；已经卡住时 systemctl --user restart pipewire wireplumber"
+        elif [[ "$prof" == *headset* || "$prof" == *hfp* ]]; then
+            note "蓝牙输出当前在通话档（api.bluez5.profile=$prof）：通话/用麦会让 PipeWire 重建图，共享会突然无画面、通话可能挂不断"
+            echo "      通话期间别用耳机麦（或让它只留 A2DP 档）；已经卡住时 systemctl --user restart pipewire wireplumber"
+        elif [[ -n "$prof" ]]; then
+            pass "音频图: 有线=$wired 蓝牙=$bt（蓝牙档位 $prof，听歌档；通话切到 HFP 时会重建图）"
         else
             pass "音频输出: 只有一种在线（有线=$wired 蓝牙=$bt）"
         fi
@@ -564,6 +582,13 @@ case "${1:-}" in
     --doctor) doctor; exit $? ;;
     --version) echo "linuxqq-wayland-fix $VERSION"; exit 0 ;;
     --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # 其余 -- 参数是刻意透传给 QQ 的（--use-gl/--use-angle/--force-device-scale-factor 等）。
+    # 但把自检敲成 --docter 这类拼写错误时会静默启动 QQ，很容易误判成"自检没输出"，
+    # 所以这里明确提示一次，行为不变。
+    --*)
+        echo "linuxqq-wayland-fix: 不认识的参数 $1 —— 将原样传给 QQ（自检请用 --doctor）" >&2
+        echo "      用法: linuxqq-wayland-fix [--doctor|--version|--help] [传给 QQ 的参数…]" >&2 ;;
+
 esac
 
 QQ=$(find_qq)
