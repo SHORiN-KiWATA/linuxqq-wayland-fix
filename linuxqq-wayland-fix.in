@@ -268,6 +268,19 @@ screenshot_helper_desktop() {
     return 1
 }
 
+# 音频图：有线和蓝牙输出同时在线时，WirePlumber 会在两者之间切换默认设备，
+# PipeWire 随之重建整个图，采集/通话客户端手里的 node 句柄失效 —— 共享会突然没画面，
+# 通话也可能挂不断。蓝牙在通话中从 A2DP 切到 HFP（用麦）同样会重建图，那条没法从
+# wpctl 输出可靠判断，这里只报"两个输出同时在线"这一种能判定、且最常见的。
+audio_graph_outputs() {
+    command -v wpctl >/dev/null 2>&1 || return 1
+    local st
+    st=$(wpctl status 2>/dev/null) || return 1
+    printf '%s %s\n' \
+        "$(printf '%s\n' "$st" | grep -c 'alsa_output')" \
+        "$(printf '%s\n' "$st" | grep -c 'bluez_output')"
+}
+
 doctor() {
     local ok=0 warn=0 fail=0
     pass() { printf '  \e[32m✓\e[0m %s\n' "$*"; ok=$((ok + 1)); }
@@ -325,6 +338,21 @@ doctor() {
     esac
 
     echo
+    echo
+    echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
+    local ag
+    if ag=$(audio_graph_outputs); then
+        local wired="${ag%% *}" bt="${ag##* }"
+        if [[ "$wired" -gt 0 && "$bt" -gt 0 ]]; then
+            note "有线和蓝牙音频输出同时在线（有线=$wired 蓝牙=$bt）：WirePlumber 会换默认设备、PipeWire 重建图，共享会突然无画面、通话可能挂不断"
+            echo "      断开其中一个，或 wpctl set-default <输出 id> 钉住默认设备；已经卡住时 systemctl --user restart pipewire wireplumber"
+        else
+            pass "音频输出: 只有一种在线（有线=$wired 蓝牙=$bt）"
+        fi
+    else
+        note "没有 wpctl，跳过音频图检查"
+    fi
+
     echo "[QQ 内部实现（QQ 更新后用来判断修复是否还适用）]"
     local vdir rdir bc av wrapper
     vdir=$(qq_version_dir)
