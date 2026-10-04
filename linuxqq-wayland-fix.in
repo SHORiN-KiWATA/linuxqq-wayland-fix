@@ -23,6 +23,10 @@ set -u
 
 VERSION="@VERSION@"
 LIBDIR="@LIBEXECDIR@"
+# 直接从源码树跑（还没 make、也没装包）时，上面两个占位符仍是 "@…@"：库路径类检查没法进行，
+# 这时明确降级为「跳过」，而不是报一串「找不到 @LIBEXECDIR@/…」的假失败。
+TEMPLATE_UNBUILT=""
+case "$VERSION$LIBDIR" in *@*) TEMPLATE_UNBUILT=1 ;; esac
 SCREENSHARE_LIB="$LIBDIR/libqq-wl-portal.so"
 CLIPBOARD_LIB="$LIBDIR/libqq-clipbridge.so"
 SCREENSHOT_LIB="$LIBDIR/libqq-screenshot.so"
@@ -309,12 +313,18 @@ audio_graph_outputs() {
 }
 
 doctor() {
-    local ok=0 warn=0 fail=0
+    local ok=0 warn=0 fail=0 skipped=0
     pass() { printf '  \e[32m✓\e[0m %s\n' "$*"; ok=$((ok + 1)); }
     note() { printf '  \e[33m!\e[0m %s\n' "$*"; warn=$((warn + 1)); }
     bad()  { printf '  \e[31m✗\e[0m %s\n' "$*"; fail=$((fail + 1)); }
+    skip() { printf '  \e[2m-\e[0m %s\n' "$*"; skipped=$((skipped + 1)); }
 
-    echo "linuxqq-wayland-fix $VERSION 自检"
+    if [[ -n "$TEMPLATE_UNBUILT" ]]; then
+        echo "linuxqq-wayland-fix （未构建模板）自检"
+        note "这是源码树里的模板（@VERSION@/@LIBEXECDIR@ 未替换）：依赖安装路径的检查标为跳过；完整自检请按 README 构建或装包后再跑"
+    else
+        echo "linuxqq-wayland-fix $VERSION 自检"
+    fi
     echo
     echo "[基础]"
     local qq; qq=$(find_qq)
@@ -325,37 +335,41 @@ doctor() {
     else
         note "未检测到已安装的 linuxqq / linuxqq-appimage 包（可能手动安装）"
     fi
-    [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
-    if clipboard_auto_disabled; then
-        note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
-    elif [[ -r "$CLIPBOARD_LIB" ]]; then
-        pass "剪贴板修复: $CLIPBOARD_LIB"
+    if [[ -n "$TEMPLATE_UNBUILT" ]]; then
+        skip "屏幕共享修复 / 剪贴板修复 / 截图防闪退 / 窗口修补: 跳过（未构建模板，@LIBEXECDIR@ 未替换）"
     else
-        bad "找不到 $CLIPBOARD_LIB"
-    fi
-    [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
-    # 截图链（GNOME）：没有 wlr-screencopy，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
-    # 或 helper 缺失时，截图会静默地全黑，日志里才有原因。KDE 走 KWin ScreenShot2，在后面单独检查。
-    if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
-        local sh_help="$LIBDIR/qq-screenshot-helper" sh_desk
-        if [[ -r "$SCREENSHOT_LIB" ]]; then
-            # 标记用门户路径的开关名：真正发起门户调用的是 helper 进程，库里没有 D-Bus 接口串。
-            # 实测：含门户路径的版本有这个串，0.2.10 之前的没有。
-            if grep -aq 'QQ_SCREENSHOT_PORTAL' "$SCREENSHOT_LIB"; then
-                pass "截图: libqq-screenshot.so 含 GNOME 门户分支"
+        [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
+        if clipboard_auto_disabled; then
+            note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
+        elif [[ -r "$CLIPBOARD_LIB" ]]; then
+            pass "剪贴板修复: $CLIPBOARD_LIB"
+        else
+            bad "找不到 $CLIPBOARD_LIB"
+        fi
+        [[ -r "$SCREENSHOT_LIB" ]] && pass "截图防闪退: $SCREENSHOT_LIB" || bad "找不到 $SCREENSHOT_LIB"
+        # 截图链（GNOME）：没有 wlr-screencopy，靠 helper 走门户。库里没有门户分支（0.2.10 之前的包）
+        # 或 helper 缺失时，截图会静默地全黑，日志里才有原因。KDE 走 KWin ScreenShot2，在后面单独检查。
+        if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]]; then
+            local sh_help="$LIBDIR/qq-screenshot-helper" sh_desk
+            if [[ -r "$SCREENSHOT_LIB" ]]; then
+                # 标记用门户路径的开关名：真正发起门户调用的是 helper 进程，库里没有 D-Bus 接口串。
+                # 实测：含门户路径的版本有这个串，0.2.10 之前的没有。
+                if grep -aq 'QQ_SCREENSHOT_PORTAL' "$SCREENSHOT_LIB"; then
+                    pass "截图: libqq-screenshot.so 含 GNOME 门户分支"
+                else
+                    bad "截图: 这份 libqq-screenshot.so 没有 GNOME 门户分支（0.2.10 之前的版本），截图会全黑，请升级本包"
+                fi
+            fi
+            [[ -x "$sh_help" ]] && pass "截图: helper 已安装（$sh_help）" \
+                || bad "截图: 缺 qq-screenshot-helper，截图会全黑（重装本包或 make install）"
+            if sh_desk=$(screenshot_helper_desktop); then
+                pass "截图: helper 的 .desktop 已安装（$sh_desk）"
             else
-                bad "截图: 这份 libqq-screenshot.so 没有 GNOME 门户分支（0.2.10 之前的版本），截图会全黑，请升级本包"
+                note "截图: 缺 qq-screenshot-helper.desktop（门户用它认调用者）"
             fi
         fi
-        [[ -x "$sh_help" ]] && pass "截图: helper 已安装（$sh_help）" \
-            || bad "截图: 缺 qq-screenshot-helper，截图会全黑（重装本包或 make install）"
-        if sh_desk=$(screenshot_helper_desktop); then
-            pass "截图: helper 的 .desktop 已安装（$sh_desk）"
-        else
-            note "截图: 缺 qq-screenshot-helper.desktop（门户用它认调用者）"
-        fi
+        [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
     fi
-    [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
     [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
     [[ -n "${DISPLAY:-}" ]] && pass "XWayland: $DISPLAY" || bad "DISPLAY 为空：QQ 的界面与剪贴板仍需要 XWayland"
     case "$(angle_mode)" in
@@ -483,6 +497,10 @@ doctor() {
                 else
                     pass "Portal: ${psvc:-xdg-desktop-portal} 运行中$pdesc"
                 fi
+            elif [[ "$piface" == *ScreenCast* ]]; then
+                # 没有 UseIn 匹配当前桌面的后端配置，不等于共享不可用：接口由默认后端
+                # （-wlr/-gtk 等）提供时 D-Bus 上照样能用，niri 就是这种。
+                pass "Portal: ${psvc:-xdg-desktop-portal} 运行中（无匹配「${XDG_CURRENT_DESKTOP}」的后端配置，ScreenCast 由默认后端提供）"
             elif [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
                 note "Portal: ${psvc:-xdg-desktop-portal} 运行中（未找到匹配「${XDG_CURRENT_DESKTOP}」的后端配置，屏幕共享可能不可用）"
             else
@@ -594,13 +612,19 @@ doctor() {
     fi
 
     echo
-    echo "通过 $ok，提醒 $warn，失败 $fail。日志：$LOG"
+    if (( skipped > 0 )); then
+        echo "通过 $ok，提醒 $warn，失败 $fail，跳过 $skipped。日志：$LOG"
+    else
+        echo "通过 $ok，提醒 $warn，失败 $fail。日志：$LOG"
+    fi
     [[ $fail -eq 0 ]]
 }
 
 case "${1:-}" in
     --doctor) doctor; exit $? ;;
-    --version) echo "linuxqq-wayland-fix $VERSION"; exit 0 ;;
+    --version)
+        if [[ -n "$TEMPLATE_UNBUILT" ]]; then echo "linuxqq-wayland-fix （未构建模板）"; else echo "linuxqq-wayland-fix $VERSION"; fi
+        exit 0 ;;
     --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     # 其余 -- 参数是刻意透传给 QQ 的（--use-gl/--use-angle/--force-device-scale-factor 等）。
     # 但把自检敲成 --docter 这类拼写错误时会静默启动 QQ，很容易误判成"自检没输出"，
