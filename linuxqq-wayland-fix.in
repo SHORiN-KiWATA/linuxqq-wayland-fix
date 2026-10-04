@@ -363,11 +363,29 @@ doctor() {
     bad()  { printf '  \e[31m✗\e[0m %s\n' "$*"; fail=$((fail + 1)); }
     skip() { printf '  \e[2m-\e[0m %s\n' "$*"; skipped=$((skipped + 1)); }
 
+    # 是否在一个可用的桌面会话里：合成器、会话 D-Bus、PipeWire 都挂在这上面。
+    # 在会话外跑（ssh、tty、systemd 单元里）时，下面那些"够不到"的检查一律跳过 ——
+    # 够不到不等于坏了，报 ✗ 只会把人引去修根本没坏的东西。
+    local in_session=1 sess_why=""
+    if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]]; then
+        in_session=0; sess_why="XDG_RUNTIME_DIR 不可用"
+    elif [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
+        in_session=0; sess_why="WAYLAND_DISPLAY 与 DISPLAY 都没有"
+    elif [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && ! -S "${XDG_RUNTIME_DIR:-/nonexistent}/bus" ]]; then
+        in_session=0; sess_why="连不上会话总线（DBUS_SESSION_BUS_ADDRESS 为空，且 \$XDG_RUNTIME_DIR/bus 不存在）"
+    fi
+    sess() { [[ $in_session -eq 1 ]]; }
+    # 会话外专用的跳过：措辞统一，让人一眼看出是"没环境"而不是"东西坏了"
+    no_sess() { skip "$1（不在桌面会话内，跳过）"; }
+
     if [[ -n "$TEMPLATE_UNBUILT" ]]; then
         echo "linuxqq-wayland-fix （未构建模板）自检"
         note "这是源码树里的模板（版本/库路径占位符未替换）：依赖安装路径的检查标为跳过；完整自检请按 README 构建或装包后再跑"
     else
         echo "linuxqq-wayland-fix $VERSION 自检"
+    fi
+    if ! sess; then
+        note "当前不在桌面会话内（$sess_why）：依赖合成器 / D-Bus / PipeWire 的检查会跳过，请在该桌面会话的终端里重跑"
     fi
     echo
     echo "[基础]"
@@ -414,8 +432,12 @@ doctor() {
         fi
         [[ -r "$BORDERFIX_LIB" ]] && pass "窗口修补（共享边框/截图覆盖层）: $BORDERFIX_LIB" || note "找不到 $BORDERFIX_LIB（共享边框会变成窗口、截图覆盖层不平铺）"
     fi
-    [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
-    [[ -n "${DISPLAY:-}" ]] && pass "XWayland: $DISPLAY" || bad "DISPLAY 为空：QQ 的界面与剪贴板仍需要 XWayland"
+    if sess; then
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] && pass "Wayland 会话: $WAYLAND_DISPLAY" || note "WAYLAND_DISPLAY 为空，不在 Wayland 会话里？"
+        [[ -n "${DISPLAY:-}" ]] && pass "XWayland: $DISPLAY" || bad "DISPLAY 为空：QQ 的界面与剪贴板仍需要 XWayland"
+    else
+        no_sess "Wayland 会话与 XWayland"
+    fi
     case "$(angle_mode)" in
         vulkan) pass "ANGLE 后端: vulkan（检测到 Vulkan，可规避观看共享花屏）" ;;
         swiftshader) note "ANGLE 后端: swiftshader（软件渲染，较慢，由 QQ_WAYLAND_FIX_ANGLE 指定）" ;;
@@ -425,7 +447,13 @@ doctor() {
     echo
     echo "[音频图（蓝牙耳机 / 共享突然无画面 / 挂不断）]"
     local ag
-    if command -v wpctl >/dev/null 2>&1 && ag=$(audio_graph_outputs); then
+    if ! sess; then
+        no_sess "音频图（PipeWire / WirePlumber）"
+    elif ! command -v wpctl >/dev/null 2>&1; then
+        note "没装 wpctl（WirePlumber 的命令行工具），跳过音频图检查"
+    elif ! wpctl status >/dev/null 2>&1; then
+        note "连不上 PipeWire（wpctl 访问不到 PipeWire 服务），跳过音频图检查"
+    elif ag=$(audio_graph_outputs); then
         local wired bt prof rest
         wired="${ag%% *}"
         rest="${ag#* }"
@@ -447,7 +475,7 @@ doctor() {
             pass "音频输出: 只有一种在线（有线=$wired 蓝牙=$bt）"
         fi
     else
-        note "没有 wpctl，跳过音频图检查"
+        note "拿不到 WirePlumber 的设备列表，跳过音频图检查"
     fi
 
     echo "[QQ 内部实现（QQ 更新后用来判断修复是否还适用）]"
@@ -510,7 +538,8 @@ doctor() {
 
     echo
     echo "[桌面环境]"
-    local de="${XDG_CURRENT_DESKTOP:-}" st="${XDG_SESSION_TYPE:-未知}" cv
+    local de="${XDG_CURRENT_DESKTOP:-}" st="${XDG_SESSION_TYPE:-}" cv
+    [[ -z "$st" ]] && st="未设置（不在会话内？）"
     cv=$(compositor_version)
     if [[ -z "$de" ]]; then
         note "桌面环境: 无法识别（XDG_CURRENT_DESKTOP 为空，$st）"
@@ -519,7 +548,9 @@ doctor() {
     else
         pass "桌面环境: $de（$st）"
     fi
-    if command -v busctl >/dev/null 2>&1; then
+    if ! sess; then
+        no_sess "Portal 与屏幕共享（xdg-desktop-portal）"
+    elif command -v busctl >/dev/null 2>&1; then
         local psvc pfile pdbus pown pstate pdesc piface ptypes
         psvc=$(pkg_installed xdg-desktop-portal)
         piface=$(portal_interfaces)
@@ -552,18 +583,29 @@ doctor() {
                 pass "Portal: ${psvc:-xdg-desktop-portal} 运行中"
             fi
             pass "Portal 接口: $piface"
+        elif ! busctl --user list >/dev/null 2>&1; then
+            # 够不到会话总线（会话外、或 D-Bus 没起来）不等于 portal 坏了
+            skip "Portal 与屏幕共享（连不上会话总线，跳过）"
         else
             bad "Portal: xdg-desktop-portal 不可用（屏幕共享、GNOME 截图修复将无法工作）"
         fi
         ptypes=$(busctl --user get-property org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
                 org.freedesktop.portal.ScreenCast AvailableSourceTypes 2>/dev/null | awk '{print $2}')
-        [[ -n "$ptypes" && "$ptypes" != 0 ]] && pass "屏幕共享：portal 录屏可用" \
-            || bad "屏幕共享：xdg-desktop-portal 没有可用的 ScreenCast 实现"
+        if [[ -n "$ptypes" && "$ptypes" != 0 ]]; then
+            pass "屏幕共享：portal 录屏可用"
+        elif ! busctl --user list >/dev/null 2>&1; then
+            # 查不到不等于没有：会话总线够不到时只能跳过
+            skip "屏幕共享：连不上会话总线，无法查询 portal 的 ScreenCast 能力（跳过）"
+        else
+            bad "屏幕共享：xdg-desktop-portal 没有可用的 ScreenCast 实现"
+        fi
     else
         note "没有 busctl，跳过 portal 检查"
     fi
     if clipboard_auto_disabled; then
         note "剪贴板：KDE Plasma 自带 XWayland 剪贴板同步，本修复已默认禁用（QQ 剪贴板照常可用）"
+    elif ! sess; then
+        no_sess "剪贴板协议探测（wayland-info）"
     elif command -v wayland-info >/dev/null 2>&1; then
         local wi; wi=$(timeout 15 wayland-info 2>/dev/null)
         if [[ -z "$wi" ]]; then
@@ -647,18 +689,29 @@ doctor() {
             skip "niri 二进制来自哪个包无法判断（没有 pacman），跳过能力宣告检查"
         fi
         ;;
+    "")
+        if sess; then
+            skip "合成器不是 niri（XDG_CURRENT_DESKTOP 未设置），跳过 niri 专属的能力宣告检查"
+        else
+            no_sess "合成器能力宣告"
+        fi
+        ;;
     *)
-        skip "合成器不是 niri（${XDG_CURRENT_DESKTOP:-未知}），跳过 niri 专属的能力宣告检查"
+        skip "合成器不是 niri（${XDG_CURRENT_DESKTOP}），跳过 niri 专属的能力宣告检查"
         ;;
     esac
     # 直接问合成器它宣告了哪些全局接口：查 /usr/share/wayland-protocols 只能证明
     # 协议定义装了，和这个合成器实不实现是两件事。
     wl_globals=""
-    if command -v wayland-info >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    if sess && command -v wayland-info >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
         wl_globals=$(timeout 15 wayland-info 2>/dev/null | grep -oE "^interface: '[^']+'" | sed "s/interface: '//; s/'//")
     fi
     if [[ -z "$wl_globals" ]]; then
-        note "拿不到合成器全局接口列表（没装 wayland-utils，或合成器没响应），跳过协议探测"
+        if sess; then
+            note "拿不到合成器全局接口列表（没装 wayland-utils，或合成器没响应），跳过协议探测"
+        else
+            no_sess "合成器协议探测（wayland-info）"
+        fi
     else
         pass "合成器宣告了 $(printf '%s\n' "$wl_globals" | wc -l) 个全局接口"
         # 有没有导出类协议只是「前提」，不能据此断言采集走不走零拷贝：本机就同时
@@ -689,7 +742,9 @@ doctor() {
         note "journal 里最近一次协商 ${live_rate} Hz 早于本次合成器启动，不作为现行值"
         live_rate=""
     fi
-    if command -v wpctl >/dev/null 2>&1; then
+    if ! sess; then
+        no_sess "采集流（PipeWire / niri journal）"
+    elif command -v wpctl >/dev/null 2>&1; then
         vstreams=$(wpctl status 2>/dev/null | grep -c 'Stream/Output/Video')
         if ((vstreams > 0)); then
             pass "当前有 $vstreams 路视频采集流"
