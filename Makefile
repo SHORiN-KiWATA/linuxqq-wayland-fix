@@ -64,10 +64,14 @@ $(CB_LIB): src/qq-clipbridge.c $(CB_GEN_H) $(CB_GEN_C)
 	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ src/qq-clipbridge.c $(CB_GEN_C) $(CB_LIBS) -lpthread -ldl
 
 # 截图修复：同样用 X11 与 wayland-client（wlr-screencopy）；KDE 下 fork/exec helper 调 KWin ScreenShot2
-$(SH_LIB): src/qq-screenshot.c build/wlr-screencopy-unstable-v1-client-protocol.h build/wlr-screencopy-unstable-v1-protocol.c
+SH_PROTOCOLS := wlr-screencopy-unstable-v1 xdg-output-unstable-v1
+SH_GEN_H   := $(SH_PROTOCOLS:%=build/%-client-protocol.h)
+SH_GEN_C   := $(SH_PROTOCOLS:%=build/%-protocol.c)
+
+$(SH_LIB): src/qq-screenshot.c $(SH_GEN_H) $(SH_GEN_C)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -Wall -Wextra -Ibuild $(CB_CFLAGS) \
 	    -DQQ_SCREENSHOT_HELPER='"$(LIBEXECDIR)/$(SHOT_HELPER)"' \
-	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ src/qq-screenshot.c build/wlr-screencopy-unstable-v1-protocol.c $(CB_LIBS) -ldl
+	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ src/qq-screenshot.c $(SH_GEN_C) $(CB_LIBS) -ldl
 
 # KDE 截图 helper：替 QQ 调 KWin ScreenShot2（kde 模式）或 portal 截图（portal 模式）；
 # 配套 .desktop 声明受限接口（KWin 按 exe 路径鉴权）
