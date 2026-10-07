@@ -10,6 +10,8 @@
 #   QQ_WAYLAND_FIX_QQ         QQ 的启动命令（默认先找 PATH 里的 linuxqq，再找 /opt/QQ/qq）
 #   QQ_WAYLAND_FIX_LOG        日志文件（默认 $XDG_RUNTIME_DIR/linuxqq-wayland-fix.log）
 #   QQ_WAYLAND_FIX_ANGLE      ANGLE 后端：auto（默认，检测到 Vulkan 时用 vulkan）| vulkan | swiftshader | off
+#   VK_DRIVER_FILES           Vulkan 设备列表。混合显卡下不设时，启动器会自动限定到显示 GPU
+#                             （规避观看共享花屏，见 docs/原理详解.md#附观看共享花屏）；自己设了就不动
 #   QQ_WL_NATIVE_DISABLE=1    关闭屏幕共享修复（排查问题用）
 #   QQ_WL_FRAME_REUSE_DISABLE=1 关闭「复用采集纹理」（排查共享时内存增长用）
 #   QQ_VOICE_LATENCY_MSEC     语音通话麦克风的录音缓冲毫秒数（默认 30；0 关闭，回到 QQ 原本的 2 秒）
@@ -292,6 +294,48 @@ angle_mode() {
     esac
 }
 
+# 显示 GPU 的 vendor：优先找有接通（connected）接口的 DRM card，取不到退回 boot_vga。
+display_gpu_vendor() {
+    local c s
+    for c in /sys/class/drm/card[0-9]*; do
+        [[ -e "$c/device/vendor" ]] || continue
+        for s in "$c"/card*-*/status; do
+            if [[ -f "$s" && "$(cat "$s" 2>/dev/null)" == "connected" ]]; then
+                cat "$c/device/vendor"
+                return 0
+            fi
+        done
+    done
+    for c in /sys/bus/pci/devices/*/boot_vga; do
+        if [[ -f "$c" && "$(cat "$c" 2>/dev/null)" == "1" ]]; then
+            cat "$(dirname "$c")/vendor"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 混合显卡规避（见 docs/原理详解.md#附观看共享花屏）：只要 NVIDIA 的 Vulkan 设备可枚举，
+# Chromium/ANGLE 在双显卡下就会走坏路径，观看共享花屏。把 QQ 能看到的 Vulkan 设备
+# 限制到显示 GPU 的 ICD 即可规避。显示在 N 卡、用户自己设过、或没有非 NVIDIA ICD 时都不动。
+restrict_vulkan_icds() {
+    [[ -n "${VK_DRIVER_FILES:-}${VK_ICD_FILENAMES:-}" ]] && return 1
+    [[ "$(angle_mode)" == "vulkan" ]] || return 1
+    local vendor
+    vendor=$(display_gpu_vendor) || return 1
+    [[ "$vendor" != "0x10de" ]] || return 1
+    local icds=() f
+    for f in /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do
+        [[ -f "$f" ]] || continue
+        grep -qi nvidia "$f" 2>/dev/null && continue
+        icds+=("$f")
+    done
+    (( ${#icds[@]} > 0 )) || return 1
+    local IFS=:
+    export VK_DRIVER_FILES="${icds[*]}"
+    return 0
+}
+
 # KDE Plasma 自带 XWayland↔Wayland 剪贴板同步（KWin/Klipper），与我们的桥冲突会让 QQ 崩溃，
 # 所以 KDE 上默认不预加载剪贴板修复；QQ_CLIPBOARD_FIX_FORCE=1 可强制启用。
 clipboard_auto_disabled() {
@@ -392,6 +436,15 @@ doctor() {
         swiftshader) note "ANGLE 后端: swiftshader（软件渲染，较慢，由 QQ_WAYLAND_FIX_ANGLE 指定）" ;;
         none) note "ANGLE 后端: 默认；若观看共享花屏，可设 QQ_WAYLAND_FIX_ANGLE=swiftshader（较慢）或改用 X11，见 docs/原理详解.md#附观看共享花屏" ;;
     esac
+    if [[ "$(angle_mode)" == "vulkan" ]] && grep -qli nvidia /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json 2>/dev/null; then
+        local dgv
+        dgv=$(display_gpu_vendor 2>/dev/null) || dgv=""
+        if [[ "$dgv" == "0x10de" ]]; then
+            note "混合显卡: 显示在 NVIDIA；观看共享若花屏，可试 QQ_WAYLAND_FIX_ANGLE=swiftshader（较慢）或改用 X11"
+        elif [[ -n "$dgv" ]]; then
+            pass "混合显卡: 启动时会自动把 QQ 的 Vulkan 限定到显示 GPU（规避观看共享花屏）"
+        fi
+    fi
 
     echo
     echo "[QQ 内部实现（QQ 更新后用来判断修复是否还适用）]"
@@ -636,6 +689,13 @@ case "$(angle_mode)" in
     swiftshader) angle_arg=(--use-angle=swiftshader) ;;
 esac
 
+# 混合显卡：把 QQ 能看到的 Vulkan 设备限定到显示 GPU（见 restrict_vulkan_icds）。
+icd_note="默认"
+if restrict_vulkan_icds; then
+    icd_note="${VK_DRIVER_FILES##*/}"
+    icd_note="${icd_note%_icd.json}"
+fi
+
 keep_crash_records
-{ echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $* angle=$(angle_mode) clipboard=$(clipboard_state)"; } >"$LOG" 2>/dev/null || LOG=/dev/null
+{ echo "=== linuxqq-wayland-fix $VERSION $(date '+%F %T') $QQ $* angle=$(angle_mode) icd=$icd_note clipboard=$(clipboard_state)"; } >"$LOG" 2>/dev/null || LOG=/dev/null
 exec "$QQ" --ozone-platform=wayland "${angle_arg[@]}" "$@" >>"$LOG" 2>&1
