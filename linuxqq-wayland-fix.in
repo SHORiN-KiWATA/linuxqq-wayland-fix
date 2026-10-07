@@ -138,16 +138,85 @@ qq_installed() {
     echo "$out"
 }
 
-# 当前桌面会选中的 portal 后端配置文件（.portal 的 UseIn 匹配 XDG_CURRENT_DESKTOP）。
-portal_backend() {
-    local de="${XDG_CURRENT_DESKTOP:-}" f d uses
-    [[ -n "$de" ]] || return 0
-    for f in /usr/share/xdg-desktop-portal/portals/*.portal; do
-        [[ -f "$f" ]] || continue
-        uses=$(sed -n 's/^UseIn=//p' "$f" | tr ';' '\n')
-        for d in ${de//:/ }; do
-            grep -qixF "$d" <<< "$uses" && { echo "$f"; return 0; }
+# 已安装的 portal 后端（.portal 文件），同名只取第一个；查找目录与 xdg-desktop-portal 相同。
+portal_impl_files() {
+    local d f n seen=" "
+    local -a data
+    IFS=: read -ra data <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for d in "${XDG_DATA_HOME:-$HOME/.local/share}" "${data[@]}" /usr/share; do
+        for f in "${d%/}"/xdg-desktop-portal/portals/*.portal; do
+            [[ -f "$f" ]] || continue
+            n=$(basename "$f" .portal)
+            [[ "$seen" == *" $n "* ]] && continue
+            seen+="$n "
+            echo "$f"
         done
+    done
+}
+
+# portals.conf 里 [preferred] 的某个键，输出后端名，一行一个。
+portal_conf_get() {
+    awk -F= -v key="$2" '
+        /^\[/ { sec = $0; next }
+        sec != "[preferred]" { next }
+        { k = $1; gsub(/[ \t]/, "", k) }
+        k == key {
+            n = split(substr($0, index($0, "=") + 1), a, ";")
+            for (i = 1; i <= n; i++) { gsub(/[ \t]/, "", a[i]); if (a[i] != "") print a[i] }
+            exit
+        }' "$1"
+}
+
+# 当前桌面下 xdg-desktop-portal 给 ScreenCast 选的后端，输出「.portal 文件<TAB>依据」；没选出来时输出空。
+# 规则同 xdg-desktop-portal 1.22：用户配置、系统配置、数据目录里每个目录取一份
+# <桌面>-portals.conf（没有就取 portals.conf），按顺序先看接口专门的那一行、再看 default=；
+# 都没选出来才退回 .portal 文件里旧的 UseIn，最后是 gtk 兜底。
+# niri 这类桌面没有 UseIn 是自己名字的后端，靠 niri-portals.conf 选后端（issue #42）。
+portal_backend() {
+    local iface=org.freedesktop.impl.portal.ScreenCast
+    local base conf de key name f
+    local -a desktops cfgdirs datadirs names
+    IFS=: read -ra desktops <<< "${XDG_CURRENT_DESKTOP:-}"
+    IFS=: read -ra cfgdirs <<< "${XDG_CONFIG_DIRS:-/etc/xdg}"
+    IFS=: read -ra datadirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    local -a all sc_impls=()
+    mapfile -t all < <(portal_impl_files)
+    for f in "${all[@]}"; do
+        sed -n 's/^Interfaces=//p' "$f" | tr ';' '\n' | grep -qxF "$iface" && sc_impls+=("$f")
+    done
+
+    for base in "${XDG_CONFIG_HOME:-$HOME/.config}" "${cfgdirs[@]}" /etc \
+                "${XDG_DATA_HOME:-$HOME/.local/share}" "${datadirs[@]}" /usr/share; do
+        conf=""
+        for de in "${desktops[@]}" ""; do
+            f="${base%/}/xdg-desktop-portal/${de:+${de,,}-}portals.conf"
+            [[ -f "$f" ]] && { conf="$f"; break; }
+        done
+        [[ -n "$conf" ]] || continue
+        # 「none」只看接口专门的那一行；没有那一行时才看 default=
+        mapfile -t names < <(portal_conf_get "$conf" "$iface")
+        [[ ${#names[@]} -gt 0 ]] || mapfile -t names < <(portal_conf_get "$conf" default)
+        [[ " ${names[*]} " == *" none "* ]] && return 0
+        for key in "$iface" default; do
+            mapfile -t names < <(portal_conf_get "$conf" "$key")
+            for name in "${names[@]}"; do
+                for f in "${sc_impls[@]}"; do
+                    [[ "$name" == "*" || "$(basename "$f" .portal)" == "$name" ]] \
+                        && { printf '%s\t%s\n' "$f" "$conf"; return 0; }
+                done
+            done
+        done
+    done
+
+    for de in "${desktops[@]}"; do
+        for f in "${sc_impls[@]}"; do
+            sed -n 's/^UseIn=//p' "$f" | tr ';' '\n' | grep -qixF "$de" \
+                && { printf '%s\tUseIn\n' "$f"; return 0; }
+        done
+    done
+    for f in "${sc_impls[@]}"; do
+        grep -qx 'DBusName=org.freedesktop.impl.portal.desktop.gtk' "$f" \
+            && { printf '%s\tgtk 兜底\n' "$f"; return 0; }
     done
 }
 
@@ -395,11 +464,14 @@ doctor() {
         pass "桌面环境: $de（$st）"
     fi
     if command -v busctl >/dev/null 2>&1; then
-        local psvc pfile pdbus pown pstate pdesc piface ptypes
+        local psvc pfile pvia pdbus pown pstate pdesc piface ptypes
         psvc=$(pkg_installed xdg-desktop-portal)
         piface=$(portal_interfaces)
         if [[ -n "$piface" ]]; then
             pfile=$(portal_backend)
+            pvia=${pfile#*$'\t'}
+            pfile=${pfile%%$'\t'*}
+            [[ "$pvia" == "$HOME"/* ]] && pvia="~${pvia#"$HOME"}"
             pdesc=""
             if [[ -n "$pfile" ]]; then
                 pdbus=$(sed -n 's/^DBusName=\(org\.freedesktop\.impl\.portal\..*\)$/\1/p' "$pfile" | head -1)
@@ -411,14 +483,14 @@ doctor() {
                 else
                     pstate="未运行"
                 fi
-                pdesc="，后端 $(basename "$pfile")（${pown:+$pown，}$pstate）"
+                pdesc="，ScreenCast 后端 $(basename "$pfile")（${pown:+$pown，}$pstate；按 $pvia 选中）"
                 if [[ "$pstate" == "未运行" ]]; then
                     note "Portal: ${psvc:-xdg-desktop-portal} 运行中$pdesc"
                 else
                     pass "Portal: ${psvc:-xdg-desktop-portal} 运行中$pdesc"
                 fi
-            elif [[ -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
-                note "Portal: ${psvc:-xdg-desktop-portal} 运行中（未找到匹配「${XDG_CURRENT_DESKTOP}」的后端配置，屏幕共享可能不可用）"
+            elif [[ "$piface" != *ScreenCast* && -n "${XDG_CURRENT_DESKTOP:-}" ]]; then
+                note "Portal: ${psvc:-xdg-desktop-portal} 运行中（没有为「${XDG_CURRENT_DESKTOP}」选出 ScreenCast 后端，屏幕共享不可用）"
             else
                 pass "Portal: ${psvc:-xdg-desktop-portal} 运行中"
             fi
