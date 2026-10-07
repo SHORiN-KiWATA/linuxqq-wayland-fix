@@ -20,7 +20,9 @@
  *   4. 其它情况照常调用 Xlib，但临时接管 X 错误（默认处理会直接退出进程）；
  *      仍然失败就给一张黑图，至少不闪退。真正的 X11 会话里截取会成功，行为不变。
  *
- * QQ_SCREENSHOT_FIX_DISABLE=1 关掉整个截图修复；
+ * 另外：共享时批注 / 激光笔绘制窗口用的显示器矩形换算成逻辑尺寸（见文件末尾 XRRGetMonitors）。
+ *
+ * QQ_SCREENSHOT_FIX_DISABLE=1 关掉整个截图修复（含上面的换算）；
  * QQ_SCREENSHOT_KDE=0 只关 KDE 路径，=1 强制走 KDE（测试用）；
  * QQ_SCREENSHOT_PORTAL=1/0 强制开/关 portal 路径（默认仅 GNOME 会话启用）；
  * QQ_SCREENSHOT_HELPER 覆盖 helper 路径（测试用）。
@@ -46,6 +48,7 @@
 #include <wayland-client.h>
 
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 
 #define LOG(...) do { fprintf(stderr, "[qq-screenshot] " __VA_ARGS__); fputc('\n', stderr); } while (0)
 
@@ -62,6 +65,8 @@ struct output {
     uint32_t *pix; /* 截到的画面，0x00RRGGBB */
     int w, h;
     int mode_w, mode_h, scale; /* wl_output 的原生模式尺寸 / scale */
+    int log_w, log_h;          /* xdg-output 的逻辑尺寸（分数缩放后） */
+    struct zxdg_output_v1 *xdg;
     struct output *next;
 };
 
@@ -69,6 +74,7 @@ struct capture {
     struct wl_display *dpy;
     struct wl_shm *shm;
     struct zwlr_screencopy_manager_v1 *mgr;
+    struct zxdg_output_manager_v1 *xdg_mgr;
     struct output *outputs;
 };
 
@@ -112,6 +118,8 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t id, const cha
         c->shm = wl_registry_bind(r, id, &wl_shm_interface, 1);
     } else if (!strcmp(iface, zwlr_screencopy_manager_v1_interface.name)) {
         c->mgr = wl_registry_bind(r, id, &zwlr_screencopy_manager_v1_interface, ver < 3 ? ver : 3);
+    } else if (!strcmp(iface, zxdg_output_manager_v1_interface.name)) {
+        c->xdg_mgr = wl_registry_bind(r, id, &zxdg_output_manager_v1_interface, 1);
     } else if (!strcmp(iface, wl_output_interface.name)) {
         struct output *o = calloc(1, sizeof *o);
         if (!o)
@@ -123,6 +131,22 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t id, const cha
     }
 }
 static void reg_remove(void *d, struct wl_registry *r, uint32_t id) { (void)d; (void)r; (void)id; }
+
+static void xdg_out_pos(void *d, struct zxdg_output_v1 *x, int32_t px, int32_t py)
+{ (void)d; (void)x; (void)px; (void)py; }
+static void xdg_out_size(void *d, struct zxdg_output_v1 *x, int32_t w, int32_t h)
+{
+    struct output *out = d;
+    (void)x;
+    out->log_w = w;
+    out->log_h = h;
+}
+static void xdg_out_done(void *d, struct zxdg_output_v1 *x) { (void)d; (void)x; }
+static void xdg_out_str(void *d, struct zxdg_output_v1 *x, const char *s) { (void)d; (void)x; (void)s; }
+static const struct zxdg_output_v1_listener xdg_output_listener = {
+    .logical_position = xdg_out_pos, .logical_size = xdg_out_size, .done = xdg_out_done,
+    .name = xdg_out_str, .description = xdg_out_str,
+};
 static const struct wl_registry_listener registry_listener = { reg_global, reg_remove };
 
 struct frame {
@@ -266,6 +290,8 @@ static void capture_free(struct capture *c)
 {
     for (struct output *o = c->outputs, *n; o; o = n) {
         n = o->next;
+        if (o->xdg)
+            zxdg_output_v1_destroy(o->xdg);
         if (o->wl)
             wl_output_destroy(o->wl);
         free(o->pix);
@@ -273,6 +299,8 @@ static void capture_free(struct capture *c)
     }
     if (c->mgr)
         zwlr_screencopy_manager_v1_destroy(c->mgr);
+    if (c->xdg_mgr)
+        zxdg_output_manager_v1_destroy(c->xdg_mgr);
     if (c->shm)
         wl_shm_destroy(c->shm);
     if (c->dpy)
@@ -305,21 +333,24 @@ static int capture_all(struct capture *c)
 /* ---------------- 按 X 的布局拼成根窗口画面 ---------------- */
 
 /*
- * 轻量查询指定 Wayland 输出的原生模式尺寸和 scale（不截帧）。
- * XGetWindowAttributes 可能被频繁调用，结果按输出名缓存 5 秒。
+ * 轻量查询指定 Wayland 输出的原生模式尺寸、scale 和逻辑尺寸（不截帧）。
+ * 合成器没有 xdg-output 时逻辑尺寸为 0。
+ * XGetWindowAttributes / XRRGetMonitors 可能被频繁调用，结果按输出名缓存 5 秒。
  */
-static int query_output_mode(const char *want, int *mode_w, int *mode_h, int *scale)
+struct output_info {
+    int mode_w, mode_h, scale, log_w, log_h;
+};
+
+static int query_output(const char *want, struct output_info *info)
 {
     static char c_name[64];
-    static int c_w, c_h, c_scale;
+    static struct output_info c_info;
     static struct timespec c_at;
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (c_name[0] && !strcmp(c_name, want) &&
         (now.tv_sec - c_at.tv_sec) * 1000 + (now.tv_nsec - c_at.tv_nsec) / 1000000 < 5000) {
-        *mode_w = c_w;
-        *mode_h = c_h;
-        *scale = c_scale;
+        *info = c_info;
         return 1;
     }
 
@@ -332,22 +363,29 @@ static int query_output_mode(const char *want, int *mode_w, int *mode_h, int *sc
     wl_display_roundtrip(c.dpy);
     wl_display_roundtrip(c.dpy); /* wl_output.name/mode/scale */
     wl_registry_destroy(reg);
+    if (c.xdg_mgr) {
+        for (struct output *o = c.outputs; o; o = o->next) {
+            o->xdg = zxdg_output_manager_v1_get_xdg_output(c.xdg_mgr, o->wl);
+            zxdg_output_v1_add_listener(o->xdg, &xdg_output_listener, o);
+        }
+        wl_display_roundtrip(c.dpy); /* zxdg_output_v1.logical_size */
+    }
 
     int found = 0;
     for (struct output *o = c.outputs; o; o = o->next)
         if (!strcmp(o->name, want) && o->mode_w > 0 && o->mode_h > 0) {
-            *mode_w = o->mode_w;
-            *mode_h = o->mode_h;
-            *scale = o->scale > 0 ? o->scale : 1;
+            info->mode_w = o->mode_w;
+            info->mode_h = o->mode_h;
+            info->scale = o->scale > 0 ? o->scale : 1;
+            info->log_w = o->log_w;
+            info->log_h = o->log_h;
             found = 1;
             break;
         }
     capture_free(&c);
     if (found) {
         snprintf(c_name, sizeof c_name, "%s", want);
-        c_w = *mode_w;
-        c_h = *mode_h;
-        c_scale = *scale;
+        c_info = *info;
         c_at = now;
     }
     return found;
@@ -1042,9 +1080,14 @@ int XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *attr)
         char name[64];
         int mx, my, mw, mh;
         if (target_monitor(dpy, name, sizeof name, &mx, &my, &mw, &mh)) {
+            struct output_info info;
             int mode_w = 0, mode_h = 0, scale = 1;
-            if (query_output_mode(name, &mode_w, &mode_h, &scale) &&
-                (mode_w != mw || mode_h != mh)) {
+            if (query_output(name, &info)) {
+                mode_w = info.mode_w;
+                mode_h = info.mode_h;
+                scale = info.scale;
+            }
+            if (mode_w > 0 && (mode_w != mw || mode_h != mh)) {
                 /* QQ 的截图覆盖层按设备像素工作：KWin/GNOME 的 XWayland 直接报原生
                  * 尺寸，Hyprland 这类报逻辑尺寸；上报逻辑尺寸会让原生截图 1:1 画进
                  * scale 倍缓冲，只填左上角。统一上报 Wayland 输出的原生模式尺寸。 */
@@ -1059,4 +1102,92 @@ int XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *attr)
         }
     }
     return r;
+}
+
+/*
+ * 共享时的批注 / 激光笔绘制窗口（issue #32、#34）。
+ *
+ * libAVSDKPlugin.so 的 QRTCServiceInterfaceWrapper::SizeUpdateProc 定时用
+ * XRRGetMonitors 取被共享显示器在 X11 里的矩形，原样交给主进程摆放绘制窗口；
+ * 主进程把它当逻辑尺寸（DIP）用（Linux 版 GetDpiForDisplay 恒为 1.0，不做换算）。
+ * KDE（旧版应用自行缩放）、xwayland-satellite 的 XWayland 报的是物理像素，
+ * 分数缩放下绘制窗口就大了 scale 倍：工具条跑到「逻辑中心」、笔迹落点错位。
+ *
+ * 这里只对 libAVSDKPlugin.so 的调用：X11 报的显示器尺寸等于该输出的物理模式尺寸、
+ * 而 xdg-output 的逻辑尺寸更小时，把矩形换算成逻辑坐标。X11 本来就报逻辑尺寸
+ * （Hyprland、KDE「由系统缩放」）或缩放为 1 时不动。同库的 DisplayIdToMonitor /
+ * DisplayIndexToMonitor 只按名字找序号，不受影响。
+ *
+ * QQ_DRAWING_RECT_FIX_DISABLE=1 可以关掉。
+ */
+typedef MonitorInfo *(*xrr_get_monitors_fn)(Display *, Window, Bool, int *);
+
+static int called_from(const void *caller, const char *lib)
+{
+    Dl_info info;
+    if (!caller || !dladdr(caller, &info) || !info.dli_fname)
+        return 0;
+    const char *base = strrchr(info.dli_fname, '/');
+    return !strcmp(base ? base + 1 : info.dli_fname, lib);
+}
+
+static int drawing_rect_fix_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *v = getenv("QQ_DRAWING_RECT_FIX_DISABLE");
+        state = enabled() && !(v && *v && strcmp(v, "0")) && getenv("WAYLAND_DISPLAY");
+    }
+    return state;
+}
+
+/* X11 显示器矩形是物理像素时换算成逻辑坐标；返回是否改了。 */
+static int monitor_to_logical(Display *dpy, MonitorInfo *m)
+{
+    char *nm = XGetAtomName(dpy, m->name);
+    if (!nm)
+        return 0;
+    struct output_info info;
+    int found = query_output(nm, &info);
+    int changed = 0;
+    if (found && info.log_w > 0 && info.log_h > 0 && m->width > 0 && m->height > 0) {
+        /* 输出旋转时模式尺寸是转之前的，X11 和 xdg-output 给的都是转之后的 */
+        int physical = (m->width == info.mode_w && m->height == info.mode_h) ||
+                       (m->width == info.mode_h && m->height == info.mode_w);
+        if (physical && (m->width != info.log_w || m->height != info.log_h)) {
+            static int logged_w, logged_h;
+            if (logged_w != m->width || logged_h != m->height) {
+                logged_w = m->width;
+                logged_h = m->height;
+                LOG("drawing rect: %s X11 %dx%d+%d+%d -> logical %dx%d", nm, m->width, m->height,
+                    m->x, m->y, info.log_w, info.log_h);
+            }
+            m->x = (int)((long)m->x * info.log_w / m->width);
+            m->y = (int)((long)m->y * info.log_h / m->height);
+            m->width = info.log_w;
+            m->height = info.log_h;
+            changed = 1;
+        }
+    }
+    XFree(nm);
+    return changed;
+}
+
+MonitorInfo *XRRGetMonitors(Display *dpy, Window w, Bool active, int *n)
+{
+    static xrr_get_monitors_fn real;
+    if (!real)
+        real = (xrr_get_monitors_fn)dlsym(RTLD_NEXT, "XRRGetMonitors");
+    if (!real) {
+        if (n)
+            *n = 0;
+        return NULL;
+    }
+
+    MonitorInfo *m = real(dpy, w, active, n);
+    if (m && n && *n > 0 && drawing_rect_fix_enabled() &&
+        called_from(__builtin_return_address(0), "libAVSDKPlugin.so"))
+        for (int i = 0; i < *n; i++)
+            monitor_to_logical(dpy, &m[i]);
+    return m;
 }
