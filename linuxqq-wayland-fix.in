@@ -572,12 +572,6 @@ doctor() {
     else
         note "没有 wayland-info，跳过剪贴板协议检查（安装 wayland-utils 可检查）"
     fi
-    # 剪贴板桥靠 libXRes（运行时 dlopen）认出合成器的 X11 剪贴板代理窗口；缺了它会静默退化，
-    # 外部复制的内容不再经桥接交给 QQ。NixOS 不用 ld.so.cache，跳过。
-    if ! clipboard_auto_disabled && [[ ! -e /etc/NIXOS ]] && command -v ldconfig >/dev/null 2>&1 \
-            && ! ldconfig -p 2>/dev/null | grep -q 'libXRes\.so\.1'; then
-        bad "剪贴板：缺少 libXRes（Arch: libxres，Debian/Ubuntu: libxres1，Fedora: libXres），认不出合成器的剪贴板代理"
-    fi
     if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
         local kde_helper="$LIBDIR/qq-screenshot-helper" kde_desktop
         kde_desktop=$(screenshot_helper_desktop)

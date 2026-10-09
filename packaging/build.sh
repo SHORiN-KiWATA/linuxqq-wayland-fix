@@ -23,7 +23,7 @@ Package: $pkg
 Version: $version-1~$label
 Architecture: $arch
 Maintainer: Shorin <shorin@example.com>
-Depends: libc6 (>= 2.34), libglib2.0-0t64 | libglib2.0-0, libx11-6, libxres1, libwayland-client0
+Depends: libc6 (>= 2.34), libglib2.0-0t64 | libglib2.0-0, libx11-6, libwayland-client0
 Recommends: linuxqq, xdg-desktop-portal
 Section: net
 Priority: optional

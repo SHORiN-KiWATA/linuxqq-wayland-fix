@@ -15,7 +15,7 @@
 
   ![](./pics/剪贴板-before.gif)
   
-  通常的解决办法是做一个剪贴板双向同步脚本。本项目没有使用类似[Linuxqq Clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)的守护进程方式，而是在 QQ 进程里起一个后台线程，用自己的 X 连接和 data-control 协议实现剪贴板桥接。性能开销更低，而且仅在 QQ 开启时生效。
+  通常的解决办法是做一个剪贴板双向同步脚本。本项目没有使用类似[Linuxqq Clipsync](https://github.com/SHORiN-KiWATA/linuxqq-clipsync)的同步方式，而是在 QQ 进程里接管 QQ 的剪贴板调用，让它直接读写 Wayland 剪贴板（data-control 协议），不再经过 X11 剪贴板：表情等 QQ 自己的格式也能在多个 QQ 账号之间复制粘贴，不会和 X11 程序或其它 QQ 进程互相争抢，而且仅在 QQ 开启时生效。
 
   >修复后
 

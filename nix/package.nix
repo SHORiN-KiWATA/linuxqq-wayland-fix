@@ -6,7 +6,6 @@
   wayland-scanner,
   glib,
   libx11,
-  libxres,
   wayland,
   libpulseaudio,
   libva,
@@ -76,17 +75,6 @@ stdenv.mkDerivation (finalAttrs: {
     "VERSION=${finalAttrs.version}"
     "PREFIX=${placeholder "out"}"
   ];
-
-  # 剪贴板桥用 dlopen("libXRes.so.1") 认出合成器（Hyprland、KWin 等）的 X11 剪贴板代理窗口。
-  # NixOS 没有全局库目录，裸名 dlopen 找不到它，而且找不到时是静默退化：
-  # 桥接把代理窗口当成普通 X11 程序，外部复制的内容不再交给 QQ（上游 #24）。
-  # 这是本项目自己的代码，直接写成 store 里的绝对路径，比放进 LD_LIBRARY_PATH
-  # 更稳（不依赖 QQ 的启动脚本保留环境变量，也不会漏给 QQ 拉起的其它程序），
-  # 字符串里的 store 路径也让 libxres 自动进入运行时闭包。
-  postPatch = ''
-    substituteInPlace src/qq-clipbridge.c \
-      --replace-fail 'dlopen("libXRes.so.1",' 'dlopen("${lib.getLib libxres}/lib/libXRes.so.1",'
-  '';
 
   buildPhase = ''
     runHook preBuild
