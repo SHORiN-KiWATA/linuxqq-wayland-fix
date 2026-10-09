@@ -59,9 +59,12 @@ build/%-protocol.c: protocol/%.xml
 	@mkdir -p build
 	$(WAYLAND_SCANNER) private-code $< $@
 
-$(CB_LIB): src/qq-clipbridge.c $(CB_GEN_H) $(CB_GEN_C)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -Wall -Ibuild $(CB_CFLAGS) \
-	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ src/qq-clipbridge.c $(CB_GEN_C) $(CB_LIBS) -lpthread -ldl
+CB_SRCS    := $(addprefix src/clipbridge/,main.c bridge.c x11.c wayland.c formats.c)
+
+# 只导出拦截 QQ 调用的函数，内部函数不会与 QQ 的符号相撞
+$(CB_LIB): $(CB_SRCS) src/clipbridge/clipbridge.h $(CB_GEN_H) $(CB_GEN_C)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -fvisibility=hidden -Wall -Wextra -Ibuild $(CB_CFLAGS) \
+	    $(LDFLAGS) -shared -Wl,-z,defs -o $@ $(CB_SRCS) $(CB_GEN_C) $(CB_LIBS) -lpthread -ldl
 
 # 截图修复：同样用 X11 与 wayland-client（wlr-screencopy）；KDE 下 fork/exec helper 调 KWin ScreenShot2
 SH_PROTOCOLS := wlr-screencopy-unstable-v1 xdg-output-unstable-v1
