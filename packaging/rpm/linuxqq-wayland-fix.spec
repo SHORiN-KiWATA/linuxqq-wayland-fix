@@ -17,7 +17,6 @@ BuildRequires:  pkgconfig(x11)
 BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  wayland-devel
 Requires:       glib2
-Requires:       libXres
 Recommends:     linuxqq
 Recommends:     xdg-desktop-portal
 
