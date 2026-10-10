@@ -410,13 +410,13 @@ tilde() {
     [[ "$1" == "$HOME"/* ]] && echo "~${1#"$HOME"}" || echo "$1"
 }
 
-# 把 $2 改写后写到用户目录的 $1，并打印做了什么：override = 改 Exec 启动本启动器；hidden = 加 NoDisplay=true。
-# 只动 [Desktop Entry] 组，[Desktop Action ...] 等原样保留。
+# 把 $2 改写后写到用户目录的 $1：override = 改 Exec 启动本启动器；hidden = 加 NoDisplay=true。
+# 只动 [Desktop Entry] 组，[Desktop Action ...] 等原样保留。用户目录里原有的同名文件先备份，并输出它的名字。
 write_desktop() {
     local id="$1" src="$2" kind="$3" dst="$USER_APPS/$1"
     if [[ -e "$dst" ]] && ! is_our_desktop "$dst"; then
         mv -f "$dst" "$dst$DESKTOP_BACKUP" || return 1
-        echo "  备份  $id → $id$DESKTOP_BACKUP"
+        echo "$id"
     fi
     awk -v kind="$kind" -v mark="$DESKTOP_MARK" '
         function extra() {
@@ -433,11 +433,7 @@ write_desktop() {
         main && kind == "override" && /^(Exec|TryExec|DBusActivatable)[ \t]*=/ { next }
         { print }
         END { if (main) extra() }
-    ' "$src" > "$dst.tmp" && mv -f "$dst.tmp" "$dst" || return 1
-    case "$kind" in
-        override) echo "  覆盖  $id，「QQ」改为启动修复版" ;;
-        hidden)   echo "  隐藏  $id，即「QQ（Wayland修复版）」" ;;
-    esac
+    ' "$src" > "$dst.tmp" && mv -f "$dst.tmp" "$dst"
 }
 
 # 用户目录原本有 mimeinfo.cache 才刷新它；没有就不生成，免得以后过期
@@ -447,8 +443,10 @@ refresh_user_apps() {
     return 0
 }
 
+tick() { printf '\e[32m✓\e[0m %s\n' "$*"; }
+
 install_desktop() {
-    local id src t targets=()
+    local id src b t targets=() backed=() hidden=0
     for id in "${QQ_DESKTOP_IDS[@]}"; do
         src=$(system_desktop "$id") && targets+=("$id=$src")
     done
@@ -457,38 +455,43 @@ install_desktop() {
         return 1
     fi
     mkdir -p "$USER_APPS" || return 1
-    echo "覆盖原生 QQ 快捷方式（$(tilde "$USER_APPS")/）："
     for t in "${targets[@]}"; do
-        write_desktop "${t%%=*}" "${t#*=}" override || return 1
+        b=$(write_desktop "${t%%=*}" "${t#*=}" override) || return 1
+        [[ -n "$b" ]] && backed+=("$b")
     done
     if src=$(system_desktop "$FIX_DESKTOP_ID"); then
-        write_desktop "$FIX_DESKTOP_ID" "$src" hidden || return 1
+        b=$(write_desktop "$FIX_DESKTOP_ID" "$src" hidden) || return 1
+        [[ -n "$b" ]] && backed+=("$b")
+        hidden=1
     fi
     refresh_user_apps
-    echo "完成。恢复原样：linuxqq-wayland-fix uninstall"
+    tick "菜单里的「QQ」改为启动修复版"
+    [[ $hidden -eq 1 ]] && tick "隐藏「QQ（Wayland修复版）」"
+    for b in "${backed[@]}"; do tick "备份原有的 $b"; done
+    echo "恢复原样：linuxqq-wayland-fix uninstall"
 }
 
 uninstall_desktop() {
-    local id f changed=()
+    local id f qq=0 shown=0 restored=()
     for id in "${QQ_DESKTOP_IDS[@]}" "$FIX_DESKTOP_ID"; do
         f="$USER_APPS/$id"
         if is_our_desktop "$f"; then
             rm -f "$f" || return 1
-            changed+=("删除  $id")
+            [[ "$id" == "$FIX_DESKTOP_ID" ]] && shown=1 || qq=1
         fi
         if [[ ! -e "$f" && -e "$f$DESKTOP_BACKUP" ]]; then
             mv "$f$DESKTOP_BACKUP" "$f" || return 1
-            changed+=("还原  $id$DESKTOP_BACKUP → $id")
+            restored+=("$id")
         fi
     done
-    if [[ ${#changed[@]} -eq 0 ]]; then
+    if [[ $qq -eq 0 && $shown -eq 0 && ${#restored[@]} -eq 0 ]]; then
         echo "没有覆盖过原生 QQ 快捷方式，无需恢复。"
         return 0
     fi
     refresh_user_apps
-    echo "恢复原生 QQ 快捷方式（$(tilde "$USER_APPS")/）："
-    printf '  %s\n' "${changed[@]}"
-    echo "完成。"
+    [[ $qq -eq 1 ]] && tick "菜单里的「QQ」恢复为原版"
+    [[ $shown -eq 1 ]] && tick "重新显示「QQ（Wayland修复版）」"
+    for id in "${restored[@]}"; do tick "还原原有的 $id"; done
 }
 
 doctor() {
