@@ -63,10 +63,13 @@ find_qq() {
     fi
 }
 
-# 正在运行的 QQ 主进程（安装版在 /opt/QQ/qq，AppImage 版在挂载目录里，可执行文件都叫 qq）
+# 正在运行的 QQ 主进程（安装版在 /opt/QQ/qq，AppImage 版在挂载目录里，可执行文件都叫 qq）。
+# 只认本用户、同一 PID 命名空间里的：docker 等容器里的 QQ（如 napcat）在宿主上也能 pgrep 到，要排除。
 qq_main_pid() {
-    local p cmd
-    for p in $(pgrep -f '(^|/)qq( |$)'); do
+    local p cmd self_ns
+    self_ns=$(readlink /proc/self/ns/pid)
+    for p in $(pgrep -u "$UID" -f '(^|/)qq( |$)'); do
+        [[ "$(readlink "/proc/$p/ns/pid" 2>/dev/null)" == "$self_ns" ]] || continue
         cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || continue
         [[ "$cmd" == *--type=* ]] && continue
         echo "$p"
