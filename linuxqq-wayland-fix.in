@@ -5,6 +5,8 @@
 #   linuxqq-wayland-fix [QQ 的参数...]   启动 QQ（应用菜单里的「QQ（Wayland修复版）」就是它）
 #   linuxqq-wayland-fix --doctor         检查环境与当前 QQ 版本是否兼容
 #   linuxqq-wayland-fix --version
+#   linuxqq-wayland-fix install          覆盖原生 QQ 快捷方式（原来的「QQ」改为启动修复版，隐藏「QQ（Wayland修复版）」）
+#   linuxqq-wayland-fix uninstall        取消覆盖，恢复原生 QQ 快捷方式
 #
 # 环境变量：
 #   QQ_WAYLAND_FIX_QQ         QQ 的启动命令（默认先找 PATH 里的 linuxqq，再找 /opt/QQ/qq）
@@ -32,6 +34,11 @@ BORDERFIX_LIB="$LIBDIR/libqq-borderfix.so"
 LOG="${QQ_WAYLAND_FIX_LOG:-${XDG_RUNTIME_DIR:-/tmp}/linuxqq-wayland-fix.log}"
 QQ_CRASH_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/QQ/crash_files"
 CRASH_KEEP="${XDG_CACHE_HOME:-$HOME/.cache}/linuxqq-wayland-fix/crash"
+USER_APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+QQ_DESKTOP_IDS=(qq.desktop linuxqq.desktop)
+FIX_DESKTOP_ID=linuxqq-wayland-fix.desktop
+DESKTOP_MARK=X-LinuxQQ-Wayland-Fix
+DESKTOP_BACKUP=.linuxqq-wayland-fix.bak
 
 # QQ 崩溃时 Bugly 把调用栈写进 crash_files/tomb_*.txt，但 linuxqq 启动脚本每次都会清空这个目录。
 # 启动前把它们复制到缓存目录保存，--doctor 会列出最近的几次。
@@ -367,18 +374,124 @@ qq_version_dir() {
 }
 
 # qq-screenshot-helper.desktop 的位置：门户（GNOME）和 KWin（KDE）都靠它认调用者。
-# 先按 XDG_DATA_DIRS 找（与桌面环境的查找方式一致），再看本包的安装前缀
-# （$LIBDIR 往上两级，如 /usr/lib/<name> -> /usr、Nix 的 store 路径）。
 screenshot_helper_desktop() {
-    local d
-    for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share} /usr/share \
-             "$(dirname "$(dirname "$LIBDIR")")/share"; do
-        if [[ -r "$d/applications/qq-screenshot-helper.desktop" ]]; then
-            echo "$d/applications/qq-screenshot-helper.desktop"
-            return 0
-        fi
+    system_desktop qq-screenshot-helper.desktop
+}
+
+# 系统里的某个 .desktop：先按 XDG_DATA_DIRS 找（与桌面环境的查找方式一致，跳过用户目录），
+# 再看 /usr/share 和本包的安装前缀（$LIBDIR 往上两级，如 /usr/lib/<name> -> /usr、Nix 的 store 路径）。
+system_desktop() {
+    local d dirs
+    IFS=: read -ra dirs <<< "${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    for d in "${dirs[@]}" /usr/share "$(dirname "$(dirname "$LIBDIR")")/share"; do
+        d=${d%/}
+        [[ -n "$d" && -r "$d/applications/$1" ]] || continue
+        [[ "$d/applications" -ef "$USER_APPS" ]] && continue
+        echo "$d/applications/$1"
+        return 0
     done
     return 1
+}
+
+# install / uninstall：覆盖原生 QQ 快捷方式。
+# 桌面环境对同名 .desktop 优先用 $XDG_DATA_HOME/applications 里的那份，所以在那里放：
+#   - QQ 包入口的副本，Exec 改成本启动器 —— 原来的「QQ」就启动修复版；
+#   - linuxqq-wayland-fix.desktop 的副本，加 NoDisplay=true —— 藏起「QQ（Wayland修复版）」，免得菜单里有两个 QQ。
+# QQ 包入口：linuxqq 和腾讯官方 deb/rpm 是 qq.desktop，linuxqq-appimage 是 linuxqq.desktop。
+# 写入的文件带 X-LinuxQQ-Wayland-Fix 标记，uninstall 只删带标记的；用户目录里原有的同名文件先改名备份，uninstall 时还原。
+# 副本带 TryExec：本工具被卸载后它不会变成点了没反应的入口，但桌面环境也不会退回 QQ 包的入口
+# （GLib 实测：用户目录的同名条目加载失败，整个 ID 就没了），所以卸载本工具前要先 uninstall。
+is_our_desktop() {
+    [[ -f "$1" ]] && grep -q "^$DESKTOP_MARK=" "$1"
+}
+
+# 显示用：家目录缩写成 ~
+tilde() {
+    [[ "$1" == "$HOME"/* ]] && echo "~${1#"$HOME"}" || echo "$1"
+}
+
+# 把 $2 改写后写到用户目录的 $1：override = 改 Exec 启动本启动器；hidden = 加 NoDisplay=true。
+# 只动 [Desktop Entry] 组，[Desktop Action ...] 等原样保留。用户目录里原有的同名文件先备份，并输出它的名字。
+write_desktop() {
+    local id="$1" src="$2" kind="$3" dst="$USER_APPS/$1"
+    if [[ -e "$dst" ]] && ! is_our_desktop "$dst"; then
+        mv -f "$dst" "$dst$DESKTOP_BACKUP" || return 1
+        echo "$id"
+    fi
+    awk -v kind="$kind" -v mark="$DESKTOP_MARK" '
+        function extra() {
+            if (kind == "override") {
+                print "Exec=linuxqq-wayland-fix %U"
+                print "TryExec=linuxqq-wayland-fix"
+            } else {
+                print "NoDisplay=true"
+            }
+            print mark "=" kind
+        }
+        /^\[/ { if (main) extra(); main = ($0 == "[Desktop Entry]"); print; next }
+        main && /^(NoDisplay|Hidden)[ \t]*=/ { next }
+        main && kind == "override" && /^(Exec|TryExec|DBusActivatable)[ \t]*=/ { next }
+        { print }
+        END { if (main) extra() }
+    ' "$src" > "$dst.tmp" && mv -f "$dst.tmp" "$dst"
+}
+
+# 用户目录原本有 mimeinfo.cache 才刷新它；没有就不生成，免得以后过期
+refresh_user_apps() {
+    [[ -f "$USER_APPS/mimeinfo.cache" ]] && command -v update-desktop-database >/dev/null 2>&1 &&
+        update-desktop-database -q "$USER_APPS" 2>/dev/null
+    return 0
+}
+
+tick() { printf '\e[32m✓\e[0m %s\n' "$*"; }
+
+install_desktop() {
+    local id src b t targets=() backed=() hidden=0
+    for id in "${QQ_DESKTOP_IDS[@]}"; do
+        src=$(system_desktop "$id") && targets+=("$id=$src")
+    done
+    if [[ ${#targets[@]} -eq 0 ]]; then
+        echo "linuxqq-wayland-fix: 找不到 QQ 的快捷方式（${QQ_DESKTOP_IDS[*]}），确认已安装 linuxqq 或 linuxqq-appimage" >&2
+        return 1
+    fi
+    mkdir -p "$USER_APPS" || return 1
+    for t in "${targets[@]}"; do
+        b=$(write_desktop "${t%%=*}" "${t#*=}" override) || return 1
+        [[ -n "$b" ]] && backed+=("$b")
+    done
+    if src=$(system_desktop "$FIX_DESKTOP_ID"); then
+        b=$(write_desktop "$FIX_DESKTOP_ID" "$src" hidden) || return 1
+        [[ -n "$b" ]] && backed+=("$b")
+        hidden=1
+    fi
+    refresh_user_apps
+    tick "菜单里的「QQ」改为启动修复版"
+    [[ $hidden -eq 1 ]] && tick "隐藏「QQ（Wayland修复版）」"
+    for b in "${backed[@]}"; do tick "备份原有的 $b"; done
+    echo "恢复原样：linuxqq-wayland-fix uninstall"
+}
+
+uninstall_desktop() {
+    local id f qq=0 shown=0 restored=()
+    for id in "${QQ_DESKTOP_IDS[@]}" "$FIX_DESKTOP_ID"; do
+        f="$USER_APPS/$id"
+        if is_our_desktop "$f"; then
+            rm -f "$f" || return 1
+            [[ "$id" == "$FIX_DESKTOP_ID" ]] && shown=1 || qq=1
+        fi
+        if [[ ! -e "$f" && -e "$f$DESKTOP_BACKUP" ]]; then
+            mv "$f$DESKTOP_BACKUP" "$f" || return 1
+            restored+=("$id")
+        fi
+    done
+    if [[ $qq -eq 0 && $shown -eq 0 && ${#restored[@]} -eq 0 ]]; then
+        echo "没有覆盖过原生 QQ 快捷方式，无需恢复。"
+        return 0
+    fi
+    refresh_user_apps
+    [[ $qq -eq 1 ]] && tick "菜单里的「QQ」恢复为原版"
+    [[ $shown -eq 1 ]] && tick "重新显示「QQ（Wayland修复版）」"
+    for id in "${restored[@]}"; do tick "还原原有的 $id"; done
 }
 
 doctor() {
@@ -398,6 +511,11 @@ doctor() {
     else
         note "未检测到已安装的 linuxqq / linuxqq-appimage 包（可能手动安装）"
     fi
+    local id overridden=()
+    for id in "${QQ_DESKTOP_IDS[@]}"; do
+        is_our_desktop "$USER_APPS/$id" && overridden+=("$(tilde "$USER_APPS/$id")")
+    done
+    [[ ${#overridden[@]} -gt 0 ]] && pass "已覆盖原生 QQ 快捷方式: ${overridden[*]}（linuxqq-wayland-fix uninstall 恢复）"
     [[ -r "$SCREENSHARE_LIB" ]] && pass "屏幕共享修复: $SCREENSHARE_LIB" || bad "找不到 $SCREENSHARE_LIB"
     if clipboard_auto_disabled; then
         note "剪贴板修复: KDE 默认禁用（Plasma 自带同步，QQ 剪贴板照常可用；QQ_CLIPBOARD_FIX_FORCE=1 强制启用）"
@@ -654,7 +772,9 @@ doctor() {
 case "${1:-}" in
     --doctor) doctor; exit $? ;;
     --version) echo "linuxqq-wayland-fix $VERSION"; exit 0 ;;
-    --help|-h) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    install) install_desktop; exit $? ;;
+    uninstall) uninstall_desktop; exit $? ;;
+    --help|-h) sed -n '2,/^[^#]/s/^# \{0,1\}//p' "$0"; exit 0 ;;
 esac
 
 QQ=$(find_qq)
