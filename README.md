@@ -137,6 +137,15 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
 linuxqq-wayland-fix --doctor
 ```
 
+想让应用菜单里原来的「QQ」直接启动修复版，可以覆盖原生 QQ 快捷方式（「QQ（Wayland修复版）」会同时隐藏）：
+
+```
+linuxqq-wayland-fix install     # 覆盖原生 QQ 快捷方式
+linuxqq-wayland-fix uninstall   # 恢复原样
+```
+
+只在 `~/.local/share/applications/` 里放同名快捷方式，不改动系统文件。卸载本工具前请先运行 `uninstall`，否则菜单里的 QQ 会消失；QQ 更新后如果原快捷方式变了（名称、图标等），再运行一次 `install` 即可。
+
 ## 已知问题或解决办法
 
 - 使用 Easy Effects 时，需在它的输入和输入排除名单里都加上 `TRAE`，否则 QQ 一开共享就会崩；
