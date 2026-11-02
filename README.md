@@ -95,7 +95,7 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
   
 - NixOS（Flake）
   
-  本仓库自带 `flake.nix`，提供 `packages.default`、`overlays.default` 和 `nixosModules.default`。NixOS 用户推荐直接用模块：
+  本仓库自带 `flake.nix`，提供 `packages.default`、`overlays.default`、`nixosModules.default` 和 `homeModules.default`。NixOS 用户推荐直接用模块：
   
   ```nix
   {
@@ -116,6 +116,31 @@ QQ 本体需另外安装（[官方下载](https://im.qq.com/linuxqq/)）。
   ```
   
   `enable = true` 会装好修复包和 `pkgs.qq`，并把 QQ 的路径告诉启动器；之后从应用菜单打开「**QQ（Wayland修复版）**」即可，自检用 `linuxqq-wayland-fix --doctor`。只想装修复包：`programs.linuxqq-wayland-fix.qq = null`。
+
+  Home Manager 用户用 `homeModules.default`，选项和上面完全一样，只是包装进用户 profile：
+
+  ```nix
+  {
+    inputs.linuxqq-wayland-fix.url = "github:SHORiN-KiWATA/linuxqq-wayland-fix";
+    inputs.home-manager.url = "github:nix-community/home-manager";
+    inputs.home-manager.inputs.nixpkgs.follows = "nixpkgs";
+
+    outputs = { self, nixpkgs, home-manager, linuxqq-wayland-fix, ... }: {
+      homeConfigurations.user = home-manager.lib.homeManagerConfiguration {
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+        modules = [
+          linuxqq-wayland-fix.homeModules.default
+          {
+            nixpkgs.config.allowUnfree = true; # pkgs.qq 是 unfree
+            programs.linuxqq-wayland-fix.enable = true;
+          }
+        ];
+      };
+    };
+  }
+  ```
+
+  Home Manager 装不了系统级的 `xdg-desktop-portal`；如果它是通过 NixOS 模块接入的，系统里没开 `xdg.portal.enable` 时模块会给出提醒。
   
   不用模块的话：
   

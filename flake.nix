@@ -55,6 +55,10 @@
         inherit mkPackage defaultQQ;
       };
 
+      homeModule = import ./nix/home-module.nix {
+        inherit mkPackage defaultQQ;
+      };
+
       perSystem = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in
     {
@@ -70,6 +74,11 @@
       nixosModules = {
         default = module;
         linuxqq-wayland-fix = module;
+      };
+
+      homeModules = {
+        default = homeModule;
+        linuxqq-wayland-fix = homeModule;
       };
 
       devShells = perSystem (pkgs: {
