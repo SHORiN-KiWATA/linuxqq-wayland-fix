@@ -47,11 +47,11 @@
 
   https://github.com/user-attachments/assets/36b6b031-19d0-4af2-9def-4e1a63a7ce11
   
->详细的逆向分析和原理见由 Deepseek V4.1 Flash 和 Opus 5.5 排查生成的：[docs/原理详解.md](docs/原理详解.md)。
+>除此之外还有更多异常。详细的逆向分析和原理见由 Deepseek V4.1 Flash 和 Opus 5.5 排查生成的：[docs/原理详解.md](docs/原理详解.md)。
 
 ## 注意事项和兼容性
 
-XWayaland 和各个桌面的 xdg-desktop-portal 需要正常工作，以下是兼容性调查表格。
+XWayland 和各个桌面的 xdg-desktop-portal 需要正常工作，以下是兼容性调查表格。
 
 测试环境：Arch Linux + 7940h + 780M，纯净安装 Niri、Hyprland、KDE Plasma、GNOME 最新版本
 
