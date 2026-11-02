@@ -96,7 +96,9 @@ static int kde_capture(void)
 
     GVariantBuilder opts;
     g_variant_builder_init(&opts, G_VARIANT_TYPE_VARDICT);
-    g_variant_builder_add(&opts, "{sv}", "native-resolution", g_variant_new_boolean(FALSE));
+    /* native-resolution=false 时 KWin 按逻辑尺寸渲染整张工作区（4K @1.5 只给
+     * 2560x1440），库侧再放大到 QQ 请求的原生尺寸就是糊的。取回设备像素。 */
+    g_variant_builder_add(&opts, "{sv}", "native-resolution", g_variant_new_boolean(TRUE));
     g_variant_builder_add(&opts, "{sv}", "include-cursor", g_variant_new_boolean(FALSE));
 
     GVariant *reply = g_dbus_connection_call_with_unix_fd_list_sync(bus, KDE_SERVICE, KDE_OBJECT,
