@@ -1,7 +1,7 @@
 
 # linuxqq-wayland-fix
 
-修复 Linux QQ 以 **Wayland** 运行时的屏幕分享、剪贴板和截图异常。
+修复 Linux QQ 以 **Wayland** 运行时的屏幕分享、剪贴板、截图、麦克风声音延迟等等异常。
 
 >一分钟视频介绍：[B 站](https://www.bilibili.com/video/BV1MKa66VEPS)
 
