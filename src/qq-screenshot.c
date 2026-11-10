@@ -69,7 +69,7 @@ struct output {
     char name[64];
     uint32_t *pix; /* 截到的画面，0x00RRGGBB */
     int w, h;
-    int mode_w, mode_h, scale; /* wl_output 的原生模式尺寸 / scale */
+    int mode_w, mode_h, scale, transform; /* wl_output 的原生模式尺寸 / scale / 旋转 */
     int log_w, log_h;          /* xdg-output 的逻辑尺寸（分数缩放后） */
     struct zxdg_output_v1 *xdg;
     struct output *next;
@@ -89,7 +89,9 @@ struct capture {
 static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph,
                          int32_t sub, const char *make, const char *model, int32_t tr)
 {
-    (void)d; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model; (void)tr;
+    struct output *out = d;
+    (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model;
+    out->transform = tr;
 }
 static void out_mode(void *d, struct wl_output *o, uint32_t f, int32_t w, int32_t h, int32_t r)
 {
@@ -478,7 +480,7 @@ static int capture_all(struct capture *c)
  * XGetWindowAttributes / XRRGetMonitors 可能被频繁调用，结果按输出名缓存 5 秒。
  */
 struct output_info {
-    int mode_w, mode_h, scale, log_w, log_h;
+    int mode_w, mode_h, scale, transform, log_w, log_h;
 };
 
 static int query_output(const char *want, struct output_info *info)
@@ -517,6 +519,7 @@ static int query_output(const char *want, struct output_info *info)
             info->mode_w = o->mode_w;
             info->mode_h = o->mode_h;
             info->scale = o->scale > 0 ? o->scale : 1;
+            info->transform = o->transform;
             info->log_w = o->log_w;
             info->log_h = o->log_h;
             found = 1;
@@ -1226,6 +1229,23 @@ int XGetWindowAttributes(Display *dpy, Window w, XWindowAttributes *attr)
                 mode_w = info.mode_w;
                 mode_h = info.mode_h;
                 scale = info.scale;
+                /* 输出旋转 90°/270° 时 wl_output.mode 报的是旋转前的尺寸：
+                 * 原生竖屏面板（如 1600x2560）在屏幕上实际以 2560x1600 显示。
+                 * 不换回来，QQ 会按 1600x2560 建截图覆盖层，把横屏画面非等比
+                 * 缩放，表现为截图画面/文字变形。 */
+                switch (info.transform) {
+                case WL_OUTPUT_TRANSFORM_90:
+                case WL_OUTPUT_TRANSFORM_270:
+                case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+                case WL_OUTPUT_TRANSFORM_FLIPPED_270: {
+                    int t = mode_w;
+                    mode_w = mode_h;
+                    mode_h = t;
+                    break;
+                }
+                default:
+                    break;
+                }
             }
             if (mode_w > 0 && (mode_w != mw || mode_h != mh)) {
                 /* QQ 的截图覆盖层按设备像素工作：KWin/GNOME 的 XWayland 直接报原生
